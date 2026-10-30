@@ -2162,10 +2162,17 @@ function setsForDate(exName, date) {
 function drawLoadDetail(cur) {
   const pts = loaderHistory(cur);
   const withKg = pts.filter(p => p.kg > 0);
+  const withKgAndReps = withKg.filter(p => p.reps >= 1);
   const bestP = withKg.reduce((b, p) => (p.kg > b.kg ? p : b), { kg: 0, reps: 0, date: "" });
-  const lastP = withKg.length ? withKg[withKg.length - 1] : null;
-  const e1last = lastP ? e1rm(lastP.kg, lastP.reps) : 0;
-  const e1first = withKg.length ? e1rm(withKg[0].kg, withKg[0].reps) : 0;
+  // 1ПМ считаем от ЛУЧШЕГО подхода с reps >= 1 (чтобы 105×0 не давал 1ПМ = 0)
+  const bestFor1pm = withKgAndReps.reduce((b, p) => {
+    const e1b = e1rm(b.kg, b.reps);
+    const ep = e1rm(p.kg, p.reps);
+    return ep > e1b ? p : b;
+  }, { kg: 0, reps: 0, date: "" });
+  const e1last = bestFor1pm.reps >= 1 ? e1rm(bestFor1pm.kg, bestFor1pm.reps) : 0;
+  const firstWithReps = withKgAndReps[0] || { kg: 0, reps: 0 };
+  const e1first = firstWithReps.kg ? e1rm(firstWithReps.kg, firstWithReps.reps) : 0;
   const growth = e1last && e1first ? Math.round((e1last - e1first) * 10) / 10 : 0;
   const statsEl = $("#loadStats"), chartEl = $("#loadChart"), legEl = $("#loadLegend"), tblEl = $("#loadTable");
   if (!statsEl) return;
@@ -2221,7 +2228,9 @@ function renderLoads() {
   if (list) list.innerHTML = names.slice(0, 15).map(n => {
     const h = loaderHistory(n);
     if (!h.length) return "";
-    const last = h[h.length - 1], first = h[0];
+    const withReps = h.filter(p => p.reps >= 1);
+    if (!withReps.length) return "";
+    const last = withReps[withReps.length - 1], first = withReps[0];
     const delta = Math.round((e1rm(last.kg, last.reps) - e1rm(first.kg, first.reps)) * 10) / 10;
     const dTxt = delta > 0.4 ? `<span style="color:var(--green)">▲ +${fmtNum(delta)} кг 1ПМ</span>` : delta < -0.4 ? `<span style="color:var(--danger)">▼ ${fmtNum(delta)} кг</span>` : `<span>· без роста</span>`;
     return `<div class="item" style="cursor:pointer" data-action="loadPick" data-name="${esc(n)}">
