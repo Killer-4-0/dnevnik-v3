@@ -1,0 +1,7 @@
+{
+  "appId": "com.killer40.dnevnik",
+  "appName": "Мой дневник здоровья",
+  "webDir": "www",
+  "server": { "androidScheme": "https" },
+  "android": { "backgroundColor": "#0a1628" }
+}
