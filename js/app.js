@@ -150,6 +150,32 @@ function persist() {
 }
 // пометка записи времени изменения (для корректного слияния устройств)
 function touch(rec) { rec.u = Date.now(); return rec; }
+
+/* Сохранение файлов. В APK (Capacitor) скачивание через <a download> не работает —
+   файл записывается во временную папку и отдаётся через системное «Поделиться / Сохранить». */
+function isNativeApp() {
+  const c = window.Capacitor;
+  return !!(c && typeof c.isNativePlatform === "function" && c.isNativePlatform() && c.Plugins && c.Plugins.Filesystem && c.Plugins.Share);
+}
+async function saveNative(filename, content, isBase64) {
+  try {
+    const opts = { path: filename, data: content, directory: "CACHE" };
+    if (!isBase64) opts.encoding = "utf8";
+    const r = await window.Capacitor.Plugins.Filesystem.writeFile(opts);
+    await window.Capacitor.Plugins.Share.share({ title: filename, url: r.uri, dialogTitle: "Сохранить или отправить файл" });
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (!/cancel/i.test(msg)) toast("Не удалось сохранить файл: " + msg, true);
+  }
+}
+function saveFile(filename, text, mime) {
+  if (isNativeApp()) { saveNative(filename, text, false); return; }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: mime }));
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 // «могильные камни» удалённых записей — чтобы удаления синхронизировались
 function tombstone(id) {
   data.del = data.del || {};
@@ -225,6 +251,137 @@ function macroCal(p, f, c) { return Math.round(4 * num(p) + 9 * num(f) + 4 * num
 function round1(v) { return Math.round(v * 10) / 10; }
 function normExName(s) { return String(s == null ? "" : s).toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim(); }
 function workoutExercises(w) { return Array.isArray(w && w.exercises) ? w.exercises : []; }
+
+/* ---- суперсеты и порядок упражнений ----
+   Суперсет = подряд идущие упражнения с одинаковым ssGroup (минимум 2). Юнит = одиночное упражнение или суперсет целиком.
+   Порядок в массиве всегда такой: сначала активные юниты, потом полностью завершённые (done). */
+function buildUnits(list) {
+  const units = [];
+  for (let i = 0; i < list.length;) {
+    let j = i;
+    const g = list[i].ssGroup;
+    if (g) while (j + 1 < list.length && list[j + 1].ssGroup === g) j++;
+    units.push({ start: i, end: j, grouped: j > i });
+    i = j + 1;
+  }
+  return units;
+}
+function runOf(list, i) {
+  const g = list[i] && list[i].ssGroup;
+  let s = i, e = i;
+  if (g) { while (s > 0 && list[s - 1].ssGroup === g) s--; while (e < list.length - 1 && list[e + 1].ssGroup === g) e++; }
+  return { start: s, end: e };
+}
+function cleanGroups(list) { buildUnits(list).forEach(u => { if (!u.grouped && list[u.start].ssGroup) delete list[u.start].ssGroup; }); }
+function settleOrder(list) { // стабильно: активные юниты вверх, завершённые вниз
+  const act = [], dn = [];
+  buildUnits(list).forEach(u => { const m = list.slice(u.start, u.end + 1); (m.every(e => e.done) ? dn : act).push(...m); });
+  list.splice(0, list.length, ...act, ...dn);
+}
+// Номера суперсетов (ssNo): стабильные — не меняются, когда суперсет завершён и уехал вниз.
+// Новый суперсет получает наименьший свободный номер.
+function assignSsNumbers(list) {
+  const units = buildUnits(list);
+  const used = new Set(), pending = [];
+  units.forEach(u => {
+    const members = list.slice(u.start, u.end + 1);
+    if (!u.grouped) { members.forEach(e => { delete e.ssNo; }); return; }
+    const no = members[0].ssNo;
+    if (no && members.every(e => e.ssNo === no) && !used.has(no)) used.add(no); else pending.push(u);
+  });
+  pending.forEach(u => {
+    const members = list.slice(u.start, u.end + 1);
+    let no = members.map(e => e.ssNo).find(n => n && !used.has(n));
+    if (!no) { no = 1; while (used.has(no)) no++; }
+    used.add(no);
+    members.forEach(e => { e.ssNo = no; });
+  });
+}
+// «3,4,1» → размеры групп подряд (1 = упражнение без суперсета)
+function ssSizesText(list) { return buildUnits(list).map(u => u.end - u.start + 1).join(","); }
+function parseSsSizes(str) {
+  const nums = String(str || "").split(/[^0-9]+/).filter(Boolean).map(Number);
+  return nums.length && nums.every(n => n >= 1) ? nums : null;
+}
+function applySsSizes(list, sizes) {
+  list.forEach(e => { delete e.ssGroup; delete e.ssNo; });
+  let p = 0;
+  sizes.forEach(n => {
+    if (n >= 2) { const id = "ss-" + uid(); for (let k = p; k < p + n && k < list.length; k++) list[k].ssGroup = id; }
+    p += n;
+  });
+  cleanGroups(list);
+}
+const SS_PROMPT = n => `Сколько упражнений в каждом суперсете — по порядку, через запятую.\nНапример: 3,4 — первые три упражнения подряд, потом следующие четыре.\n(1 = упражнение без суперсета.)\nУпражнений: ${n}`;
+// Старые данные: первое упражнение суперсета не получало ssGroup (его получали только «связанные с предыдущим»)
+function ensureGroupsV2(obj) {
+  if (!obj || obj.ssv === 2) return false;
+  const list = Array.isArray(obj.exercises) ? obj.exercises : [];
+  for (let i = 1; i < list.length; i++) if (list[i].ssGroup && !list[i - 1].ssGroup) list[i - 1].ssGroup = list[i].ssGroup;
+  obj.ssv = 2;
+  return true;
+}
+
+/* Перетаскивание на pointer events: работает и мышью, и пальцем.
+   (HTML5 drag-and-drop на телефонах ненадёжен, а на карточке с полями ввода не срабатывает вовсе.)
+   Тянем за ручку handleSel; элемент следует за пальцем, линия показывает, куда он встанет.
+   onDrop получает новый порядок — массив значений data-u элементов. */
+function makeSortable(container, itemSel, handleSel, onDrop) {
+  if (!container) return;
+  container.addEventListener("pointerdown", e => {
+    const handle = e.target.closest(handleSel);
+    if (!handle || !container.contains(handle)) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const item = handle.closest(itemSel);
+    if (!item || item.parentElement !== container) return;
+    e.preventDefault();
+    const scroller = container.closest(".modal") || document.scrollingElement;
+    const startY = e.clientY, startScroll = scroller.scrollTop;
+    let lastY = startY, raf = 0, target = null, atEnd = false;
+    const sibs = () => [...container.children].filter(c => c !== item && c.matches(itemSel));
+    const clearMarks = () => container.querySelectorAll(".drop-before,.drop-end").forEach(x => x.classList.remove("drop-before", "drop-end"));
+    const update = () => {
+      item.style.transform = `translateY(${lastY - startY + (scroller.scrollTop - startScroll)}px)`;
+      clearMarks();
+      target = null; atEnd = false;
+      const list = sibs();
+      for (const sb of list) { const r = sb.getBoundingClientRect(); if (lastY < r.top + r.height / 2) { target = sb; break; } }
+      if (target) target.classList.add("drop-before");
+      else if (list.length) { atEnd = true; list[list.length - 1].classList.add("drop-end"); }
+    };
+    const tick = () => {
+      const r = scroller === document.scrollingElement ? { top: 0, bottom: window.innerHeight } : scroller.getBoundingClientRect();
+      if (lastY < r.top + 70) scroller.scrollTop -= 12;
+      else if (lastY > r.bottom - 70) scroller.scrollTop += 12;
+      update();
+      raf = requestAnimationFrame(tick);
+    };
+    item.classList.add("dragging");
+    try { handle.setPointerCapture(e.pointerId); } catch (_) { /* не критично */ }
+    const move = ev => { lastY = ev.clientY; };
+    const end = ev => {
+      cancelAnimationFrame(raf);
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", end);
+      handle.removeEventListener("pointercancel", end);
+      update();
+      const list = sibs();
+      const order = list.map(c => +c.dataset.u);
+      const me = +item.dataset.u;
+      const at = target ? list.indexOf(target) : (atEnd ? list.length : order.length);
+      order.splice(at, 0, me);
+      clearMarks();
+      item.classList.remove("dragging");
+      item.style.transform = "";
+      if (ev.type !== "pointercancel") onDrop(order);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+    raf = requestAnimationFrame(tick);
+  });
+  container.addEventListener("contextmenu", e => { if (e.target.closest(handleSel)) e.preventDefault(); });
+}
 function sortedWorkouts() { return [...data.workouts].sort((a, b) => b.date.localeCompare(a.date) || (b.startedAt || 0) - (a.startedAt || 0)); }
 function fmtSet(s) {
   const w = s && (s.weight == null || s.weight === "") ? null : num(s.weight);
@@ -1164,7 +1321,8 @@ function openTrainingSession(planId) {
   if (!plan) return;
   let w = data.workouts.find(x => x.planId === planId && x.status === "in_progress");
   if (!w) {
-    w = touch({ id: uid(), date: selectedDate, name: plan.name, planId, status: "in_progress", startedAt: Date.now(), minutes: 0, cal: 0, exercises: plan.exercises.map(e => ({ name: e.name, sets: [] })) });
+    ensureGroupsV2(plan);
+    w = touch({ id: uid(), date: selectedDate, name: plan.name, planId, status: "in_progress", startedAt: Date.now(), minutes: 0, cal: 0, ssv: 2, exercises: plan.exercises.map(e => { const o = { name: e.name, sets: [] }; if (e.ssGroup) { o.ssGroup = e.ssGroup; if (e.ssNo) o.ssNo = e.ssNo; } return o; }) });
     data.workouts.push(w);
     persist();
     renderWorkouts();
@@ -1181,40 +1339,27 @@ function renderTrainingSession(wid) {
   const plan = data.plans.find(p => p.id === w.planId);
   const planEx = (plan && plan.exercises) || [];
   const exs = workoutExercises(w);
-  // Нормализация суперсетов: сохраняем исходные ssGroup значения от плана,
-  // но группируем смежные упражнения в группы для корректной работы таймера
-  let groupCounter = 0;
-  let pendingGroup = null;
-  for (let i = 0; i < exs.length; i++) {
-    if (exs[i].ssGroup) {
-      if (!pendingGroup || pendingGroup.groupId !== exs[i].ssGroup) {
-        // Новая группа суперсета
-        groupCounter++;
-        pendingGroup = { start: i, groupId: exs[i].ssGroup };
-      } else {
-        // Продолжаем текущую группу
-      }
-      // Определяем конец группы
-      let end = i;
-      for (let j = i + 1; j < exs.length && exs[j].ssGroup === exs[i].ssGroup; j++) {
-        end = j;
-      }
-      // Помечаруем все упражнения группы
-      for (let k = i; k <= end; k++) {
-        exs[k].ssGroup = groupCounter;
-        exs[k]._ssGroupIndex = groupCounter;
-      }
-      i = end; // пропускаем уже обработанные
-    } else {
-      pendingGroup = null;
-    }
-  }
+  if (ensureGroupsV2(w)) persist();
+  assignSsNumbers(workoutExercises(w));
+  const prevScroll = ($(".modal") || {}).scrollTop || 0;
   // Время тренировки
   const startedAt = w.startedAt ? new Date(w.startedAt) : null;
   const startTimeStr = startedAt ? `${String(startedAt.getHours()).padStart(2,"0")}:${String(startedAt.getMinutes()).padStart(2,"0")}` : "";
   // Сохраним нормализованные exs для restAfterSet (суперсеты)
   renderTrainingSession.wExs = exs;
-  const rows = exs.map((ex, i) => {
+  const units = buildUnits(exs);
+  const grouped = new Set();
+  units.forEach(u => { if (u.grouped) for (let k = u.start; k <= u.end; k++) grouped.add(k); });
+  const cards = exs.map((ex, i) => {
+    if (ex.done) {
+      const chips = ex.sets.length ? ex.sets.map((s, j) => `<span class="set-chip">${esc(fmtSet(s))}<button class="edit-set" data-action="editSet" data-id="${w.id}" data-i="${i}" data-j="${j}" title="Редактировать подход">✎</button><button data-action="delSet" data-id="${w.id}" data-i="${i}" data-j="${j}" title="Удалить подход">✕</button></span>`).join("") : `<span class="empty" style="padding:4px 0">Подходов нет</span>`;
+      return `
+    <div class="ts-ex done" data-ex-index="${i}">
+      <div class="ts-ex-head"><span class="ts-title"><b>✓ ${esc(ex.name)}</b></span><span class="small-actions"><button class="small ghost" data-action="reopenEx" data-id="${w.id}" data-i="${i}" title="Вернуть упражнение в работу">↩ Вернуть</button></span></div>
+      <div class="ts-sets">${chips}</div>
+      ${ex.note ? `<div class="ts-last">📝 ${esc(ex.note)}</div>` : ""}
+    </div>`;
+    }
     const last = lastSetsFor(ex.name, w);
     const planHint = planEx.find(pe => normExName(pe.name) === normExName(ex.name));
     const planTxt = planHint ? ` · план: ${planHint.sets}×${esc(planHint.reps)}${planHint.weight ? " · " + esc(planHint.weight) : ""}` : "";
@@ -1268,8 +1413,8 @@ function renderTrainingSession(wid) {
       }
     }
     return `
-    <div class="ts-ex" draggable="true" data-ex-index="${i}">
-      <div class="ts-ex-head"><b title="Перетащите для изменения порядка">⇅ ${esc(ex.name)}</b>${ex.ssGroup ? ` <span class="badge" title="Суперсет №${ex.ssGroup}: отдых только после последнего упражнения группы">⛓ ${ex.ssGroup}</span>` : ""}<span class="small-actions"><button class="small ghost" data-action="toggleSuperset" data-id="${w.id}" data-i="${i}" title="Убрать/добавить в суперсет (без отдыха между упражнениями группы)">⛓</button><button class="small ghost" data-action="toggleProgressHint" data-id="${w.id}" data-i="${i}" title="Отключить рекомендацию веса для этого упражнения">${(data.settings.skipProgressHint && data.settings.skipProgressHint.includes(normExName(ex.name))) ? '🔔' : '🔇'}</button><button class="icon-btn" data-action="delSessionEx" data-id="${w.id}" data-i="${i}" title="Удалить упражнение">✕</button></span></div>
+    <div class="ts-ex" data-ex-index="${i}">
+      <div class="ts-ex-head"><span class="ts-title">${grouped.has(i) ? "" : `<span class="ts-handle" title="Перетащить для смены порядка">⇅</span>`}<b>${esc(ex.name)}</b></span><span class="small-actions">${grouped.has(i) ? `${runOf(exs, i).start < i ? `<button class="small ghost" data-action="splitSuperset" data-id="${w.id}" data-i="${i}" title="Начать новый суперсет с этого упражнения">✂</button>` : ""}<button class="small ghost" data-action="toggleSuperset" data-id="${w.id}" data-i="${i}" title="Убрать из суперсета">⛓✕</button>` : (i > 0 ? `<button class="small ghost" data-action="toggleSuperset" data-id="${w.id}" data-i="${i}" title="Связать с предыдущим упражнением в суперсет">⛓</button>` : "")}<button class="small ghost" data-action="toggleProgressHint" data-id="${w.id}" data-i="${i}" title="Отключить рекомендацию веса для этого упражнения">${(data.settings.skipProgressHint && data.settings.skipProgressHint.includes(normExName(ex.name))) ? '🔔' : '🔇'}</button><button class="icon-btn" data-action="delSessionEx" data-id="${w.id}" data-i="${i}" title="Удалить упражнение">✕</button></span></div>
       <div class="ts-last">${last ? `Прошлый раз (${fmtDateShort(last.date)}): <b>${esc(setsLine(last.sets))}</b>` : "Прошлый раз: записей нет"}${progHint}${planTxt}</div>
       <div class="ts-sets">${ex.sets.length ? ex.sets.map((s, j) => `<span class="set-chip">${esc(fmtSet(s))}<button class="edit-set" data-action="editSet" data-id="${w.id}" data-i="${i}" data-j="${j}" title="Редактировать подход">✎</button><button data-action="delSet" data-id="${w.id}" data-i="${i}" data-j="${j}" title="Удалить подход">✕</button></span>`).join("") : `<span class="empty" style="padding:4px 0">Подходы пока не записаны</span>`}</div>
       <div class="ts-input-row">
@@ -1282,13 +1427,27 @@ function renderTrainingSession(wid) {
         <button class="small primary" data-action="addSet" data-id="${w.id}" data-i="${i}">Записать подход</button>
       </div>
       <input class="ts-note" data-i="${i}" placeholder="📝 заметка (напр. ломит запястье)" value="${esc(ex.note || "")}" style="margin-top:6px">
+      <button class="finish-ex" data-action="finishEx" data-id="${w.id}" data-i="${i}" title="Упражнение уйдёт вниз списка; подходы можно будет поправить">✓ Закончить упражнение</button>
     </div>`;
-  }).join("");
+  });
+  const unitDone = u => exs.slice(u.start, u.end + 1).every(e => e.done);
+  const unitHtml = u => {
+    if (!u.grouped) return `<div class="ts-unit" data-u="${u.start}">${cards[u.start]}</div>`;
+    const names = exs.slice(u.start, u.end + 1).map(e => esc(e.name)).join(" + ");
+    const done = unitDone(u);
+    const no = exs[u.start].ssNo || 1;
+    return `<div class="ts-unit ts-group${done ? " done" : ""}" data-u="${u.start}" data-c="${(no - 1) % 4}"><div class="ts-group-head">${done ? "" : `<span class="ts-handle" title="Перетащить весь суперсет">⇅</span>`}<b>⛓ Суперсет ${no}</b><span class="ts-group-count">${u.end - u.start + 1} упр. подряд, без отдыха</span><small>${names}</small></div>${cards.slice(u.start, u.end + 1).join("")}</div>`;
+  };
+  const activeHtml = units.filter(u => !unitDone(u)).map(unitHtml).join("");
+  const doneHtml = units.filter(unitDone).map(unitHtml).join("");
+  const doneCnt = exs.filter(e => e.done).length;
   openModal(`
     <div class="modal-head"><h3>${esc(w.name)} — запись подходов</h3><button class="close-x" data-action="closeSession">✕</button></div>
     <div class="hint" style="margin:0 0 10px">Вес и повторы вводятся по ходу тренировки. Всё сохраняется сразу — можно закрыть приложение и продолжить позже (кнопка «Продолжить» в списке тренировок за день).</div>
-    <div id="tsList">${rows || `<div class="empty">В этом плане нет упражнений — добавьте их кнопкой ниже.</div>`}</div>
-    <div class="hint" style="margin:0 0 8px">💡 Перетащите упражнение за ⇅ для изменения порядка · ⛓ суперсет — отдых только после последнего упражнения группы</div>
+    ${exs.length ? `<div class="ts-toolbar"><span class="hint" style="margin:0">Завершено упражнений: <b>${doneCnt}</b> из ${exs.length}</span>${exs.length - doneCnt >= 2 ? `<button class="small ghost" data-action="setSupersets" data-id="${w.id}">⛓ Суперсеты…</button>` : ""}</div>` : ""}
+    <div id="tsList">${activeHtml || (doneHtml ? `<div class="empty">Все упражнения завершены ✓ Можно завершать тренировку.</div>` : `<div class="empty">В этом плане нет упражнений — добавьте их кнопкой ниже.</div>`)}</div>
+    ${doneHtml ? `<div class="ts-done-title">✓ Завершённые упражнения (подходы можно поправить)</div><div id="tsDone">${doneHtml}</div>` : ""}
+    <div class="hint" style="margin:0 0 8px">💡 Тяните за ⇅, чтобы поменять порядок · «⛓ Суперсеты…» — разбить упражнения на группы (напр. 3,4); ✂ — начать новый суперсет с этого упражнения (отдых только после последнего упражнения группы) · «Закончить упражнение» уводит его вниз списка</div>
     <details class="timer-window">
       <summary>⏱ Таймер отдыха</summary>
       <div class="panel rest-panel" style="margin:0 0 12px;padding:12px">
@@ -1321,45 +1480,17 @@ function renderTrainingSession(wid) {
       <button class="ghost" data-action="closeSession">Закрыть (не удалять)</button>
     </div>
   `);
-  // === Drag & Drop для перемещения упражнений ===
-  let dragIdx = null;
-  const list = $("#tsList");
-  if (list) {
-    list.querySelectorAll(".ts-ex").forEach(el => {
-      el.addEventListener("dragstart", e => {
-        dragIdx = +el.dataset.exIndex;
-        el.style.opacity = "0.4";
-        e.dataTransfer.effectAllowed = "move";
-      });
-      el.addEventListener("dragend", () => {
-        el.style.opacity = "1";
-        dragIdx = null;
-        list.querySelectorAll(".ts-ex").forEach(x => x.style.borderTop = "");
-      });
-      el.addEventListener("dragover", e => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "move";
-        el.style.borderTop = "2px solid var(--accent)";
-      });
-      el.addEventListener("dragleave", () => {
-        el.style.borderTop = "";
-      });
-      el.addEventListener("drop", e => {
-        e.preventDefault();
-        el.style.borderTop = "";
-        const dropIdx = +el.dataset.exIndex;
-        if (dragIdx !== null && dragIdx !== dropIdx) {
-          const exs = workoutExercises(w);
-          const [moved] = exs.splice(dragIdx, 1);
-          exs.splice(dropIdx, 0, moved);
-          w.exercises = exs;
-          touch(w);
-          persist();
-          renderTrainingSession(w.id);
-        }
-      });
-    });
-  }
+  { const m = $(".modal"); if (m) m.scrollTop = prevScroll; }
+  makeSortable($("#tsList"), ".ts-unit", ".ts-handle", order => {
+    const cur = workoutExercises(w);
+    const us = buildUnits(cur);
+    const byStart = new Map(us.map(u => [u.start, u]));
+    const out = [];
+    order.forEach(st => { const u = byStart.get(st); if (u) out.push(...cur.slice(u.start, u.end + 1)); });
+    us.filter(u => cur.slice(u.start, u.end + 1).every(e => e.done)).forEach(u => out.push(...cur.slice(u.start, u.end + 1)));
+    if (out.length === cur.length) { w.exercises = out; touch(w); persist(); }
+    renderTrainingSession(w.id);
+  });
   restDraw();
   $("#restDur").addEventListener("change", e => {
     const custom = $("#restCustom");
@@ -1411,21 +1542,24 @@ function addSetBtn(wid, i) {
     toast(`🔥 Новый рекорд «${w.exercises[i].name}»: ${fmtNum(wgt)} кг × ${reps} (было ${fmtNum(pastBest.kg)} кг)`);
     announced = true;
   }
-  // суперсет: отдых запускается только после последнего упражнения группы
-  const ssGroup = renderTrainingSession.wExs ? renderTrainingSession.wExs[i].ssGroup : undefined;
-  const inGroup = ssGroup !== undefined;
-  
-  let isLastInGroup = false;
-  if (inGroup && renderTrainingSession.wExs) {
-    // Найти максимальный индекс среди упражнений с этим ssGroup
-    const groupIndices = renderTrainingSession.wExs
-      .map((ex, idx) => ex.ssGroup === ssGroup ? idx : -1)
-      .filter(idx => idx >= 0);
-    isLastInGroup = groupIndices.length > 0 && i === Math.max(...groupIndices);
+  // суперсет: отдых только после последнего (незавершённого) упражнения группы, до этого — сразу к следующему
+  const exsNow = workoutExercises(w);
+  const run = runOf(exsNow, i);
+  let nextIdx = -1;
+  for (let j = i + 1; j <= run.end; j++) if (!exsNow[j].done) { nextIdx = j; break; }
+  if (run.end > run.start && nextIdx >= 0) {
+    if (!announced) toast("Суперсет: теперь следующее упражнение, без отдыха ⛓");
+    const inp = $(`.ts-r[data-i="${nextIdx}"]`);
+    if (inp) { inp.scrollIntoView({ block: "center", behavior: "smooth" }); inp.focus({ preventScroll: true }); }
+  } else {
+    if (run.end > run.start) { // круг закончен: показываем первое незавершённое упражнение группы для следующего круга
+      let first = -1;
+      for (let j = run.start; j <= run.end; j++) if (!exsNow[j].done) { first = j; break; }
+      const card = first >= 0 ? $(`.ts-ex[data-ex-index="${first}"]`) : null;
+      if (card) card.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+    if (auto) restStart(sec);
   }
-
-  if (!announced && inGroup && !isLastInGroup) toast("Суперсет: следующий подход без отдыха ⛓");
-  if (auto && (isLastInGroup || !inGroup)) restStart(sec);
 }
 
 function finishWorkout(wid) {
@@ -1479,12 +1613,14 @@ function renderExHints(ex, renderRows) {
 }
 
 function openPlanEditor(plan) {
+  ensureGroupsV2(plan);
   const ex = (plan && plan.exercises) || [{ name: "", sets: 3, reps: "12", weight: "" }];
   openModal(`
     <div class="modal-head"><h3>${plan ? "Изменить план" : "Новый тренировочный план"}</h3><button class="close-x" data-action="closeModal">✕</button></div>
     <label class="field">Название плана<input id="planName" value="${esc(plan ? plan.name : "")}" placeholder="Например: День спины" required></label>
     <div id="exHints" style="margin-top:10px"></div>
-    <div class="hint" style="margin:10px 0 4px">💡 Перетащите упражнение за ⇅ для изменения порядка</div>
+    <div class="hint" style="margin:10px 0 4px">💡 Тяните за ⇅, чтобы поменять порядок. Суперсет — упражнения подряд без отдыха.</div>
+    <button class="ghost" data-action="planSupersets" style="width:100%;margin-bottom:6px">⛓ Разбить на суперсеты (напр. 3,4)</button>
     <div id="exRows" style="margin-top:8px"></div>
     <div class="btn-row">
       <button class="ghost" data-action="addExRow">＋ Упражнение</button>
@@ -1492,9 +1628,12 @@ function openPlanEditor(plan) {
     </div>
   `);
   const renderRows = () => {
-    $("#exRows").innerHTML = ex.map((e, i) => `
-      <div class="ex-drag" draggable="true" data-ex-index="${i}">
-        <div class="ex-drag-head"><b title="Перетащите для изменения порядка">⇅ Упражнение ${i + 1}</b></div>
+    cleanGroups(ex); assignSsNumbers(ex);
+    $("#exRows").innerHTML = ex.map((e, i) => {
+      const run = runOf(ex, i), inSs = run.end > run.start;
+      return `
+      <div class="ex-drag${inSs ? " in-ss" : ""}" data-u="${i}"${inSs ? ` data-c="${((e.ssNo || 1) - 1) % 4}"` : ""}>
+        <div class="ex-drag-head"><span class="ts-handle" title="Перетащить для смены порядка">⇅</span><b>Упражнение ${i + 1}</b>${inSs ? ` <span class="badge ss-badge">⛓ Суперсет ${e.ssNo || 1} · ${i - run.start + 1} из ${run.end - run.start + 1}</span>` : ""}</div>
         <div class="field-grid">
           <label class="field" style="grid-column:1/-1"><input class="ex-name" data-i="${i}" value="${esc(e.name)}" placeholder="Например: жим лёжа"></label>
           <label class="field">Подходы<input class="ex-sets" data-i="${i}" type="number" min="1" value="${e.sets}"></label>
@@ -1503,51 +1642,32 @@ function openPlanEditor(plan) {
         </div>
         <div style="margin-top:6px;display:flex;align-items:center;gap:6px">
           <label class="autocal-chk">
-            <input type="checkbox" class="chk-ss" data-i="${i}" ${(e && e.ssGroup) ? "checked" : ""}>
+            <input type="checkbox" class="chk-ss" data-i="${i}" ${(i > 0 && e && e.ssGroup && ex[i - 1] && ex[i - 1].ssGroup === e.ssGroup) ? "checked" : ""} ${i === 0 ? "disabled" : ""}>
             Суперсет с предыдущим
           </label>
         </div>
-      </div>`).join("");
+      </div>`;
+    }).join("");
   };
   renderRows();
   renderExHints(ex, renderRows);
-  // === Drag & Drop для перемещения упражнений (как в живой тренировке) ===
-  let dragIdx = null;
   const rowsEl = $("#exRows");
-  rowsEl.addEventListener("dragstart", e => {
-    if (e.target.closest("input,label")) return; // не тащим с полей ввода
-    const el = e.target.closest("[data-ex-index]");
-    if (!el) return;
-    dragIdx = +el.dataset.exIndex;
-    el.style.opacity = "0.4";
-    e.dataTransfer.effectAllowed = "move";
+  $("[data-action=planSupersets]").addEventListener("click", () => {
+    if (ex.length < 2) { toast("Добавьте хотя бы два упражнения", true); return; }
+    const ans = prompt(SS_PROMPT(ex.length), ssSizesText(ex));
+    if (ans == null) return;
+    const sizes = parseSsSizes(ans);
+    if (!sizes) { toast("Введите числа через запятую, например 3,4", true); return; }
+    const sum = sizes.reduce((a, b) => a + b, 0);
+    if (sum > ex.length) { toast(`Сумма ${sum} больше числа упражнений (${ex.length})`, true); return; }
+    applySsSizes(ex, sizes);
+    renderRows();
   });
-  rowsEl.addEventListener("dragend", () => {
-    dragIdx = null;
-    rowsEl.querySelectorAll("[data-ex-index]").forEach(x => { x.style.opacity = ""; x.style.borderTop = ""; });
-  });
-  rowsEl.addEventListener("dragover", e => {
-    const el = e.target.closest("[data-ex-index]");
-    if (!el) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    el.style.borderTop = "2px solid var(--accent)";
-  });
-  rowsEl.addEventListener("dragleave", e => {
-    const el = e.target.closest("[data-ex-index]");
-    if (el) el.style.borderTop = "";
-  });
-  rowsEl.addEventListener("drop", e => {
-    const el = e.target.closest("[data-ex-index]");
-    if (!el) return;
-    e.preventDefault();
-    el.style.borderTop = "";
-    const dropIdx = +el.dataset.exIndex;
-    if (dragIdx !== null && dragIdx !== dropIdx) {
-      const [moved] = ex.splice(dragIdx, 1);
-      ex.splice(dropIdx, 0, moved);
-      renderRows();
-    }
+  makeSortable(rowsEl, ".ex-drag", ".ts-handle", order => {
+    const old = ex.slice();
+    order.forEach((from, k) => { ex[k] = old[from]; });
+    cleanGroups(ex);
+    renderRows();
   });
   $("[data-action=addExRow]").addEventListener("click", () => { ex.push({ name: "", sets: 3, reps: "12", weight: "" }); renderRows(); });
   $("#exRows").addEventListener("input", e => {
@@ -1557,29 +1677,35 @@ function openPlanEditor(plan) {
     if (e.target.classList.contains("ex-reps")) ex[i].reps = e.target.value;
     if (e.target.classList.contains("ex-weight")) ex[i].weight = e.target.value;
   });
-  // Обработка чекбоксов суперсета
+  // Чекбокс «Суперсет с предыдущим»: связывает упражнение (и его хвост) с предыдущим либо разрывает связь
   rowsEl.addEventListener("change", e => {
-    if (e.target.classList.contains("chk-ss")) {
-      const i = +e.target.dataset.i;
-      if (e.target.checked) {
-        const prev = ex[i - 1];
-        if (prev && prev.ssGroup) {
-          ex[i].ssGroup = prev.ssGroup;
-        } else {
-          ex[i].ssGroup = 'ss-' + i;
-        }
-      } else {
-        delete ex[i].ssGroup;
+    if (!e.target.classList.contains("chk-ss")) return;
+    const i = +e.target.dataset.i;
+    if (e.target.checked) {
+      const prev = ex[i - 1];
+      if (prev) {
+        const id = prev.ssGroup || ("ss-" + uid());
+        const old = ex[i].ssGroup;
+        prev.ssGroup = id;
+        ex[i].ssGroup = id;
+        if (old) for (let k = i + 1; k < ex.length && ex[k].ssGroup === old; k++) ex[k].ssGroup = id;
       }
+    } else if (ex[i].ssGroup) {
+      const old = ex[i].ssGroup, nid = "ss-" + uid();
+      for (let k = i; k < ex.length && ex[k].ssGroup === old; k++) ex[k].ssGroup = nid;
     }
+    cleanGroups(ex);
+    renderRows();
   });
   $(".modal").addEventListener("click", e => {
     if (e.target.closest("[data-action=savePlan]")) {
       const name = $("#planName").value.trim();
       if (!name) { toast("Укажите название", true); return; }
-      const exercises = ex.map(x => ({ name: x.name, sets: num(x.sets) || 3, reps: x.reps || "", weight: x.weight || "", ssGroup: x.ssGroup || null })).filter(x => x.name);
+      const named = ex.filter(x => x.name && x.name.trim());
+      cleanGroups(named); assignSsNumbers(named);
+      const exercises = named.map(x => ({ name: x.name, sets: num(x.sets) || 3, reps: x.reps || "", weight: x.weight || "", ssGroup: x.ssGroup || null, ssNo: x.ssGroup ? (x.ssNo || null) : null }));
       if (!exercises.length) { toast("Добавьте хотя бы одно упражнение", true); return; }
-      const p = touch({ id: plan ? plan.id : uid(), name, exercises });
+      const p = touch({ id: plan ? plan.id : uid(), name, exercises, ssv: 2 });
       if (plan) data.plans = data.plans.map(x => x.id === plan.id ? p : x);
       else data.plans.push(p);
       closeModal(); refresh(); toast("План сохранён");
@@ -1781,16 +1907,16 @@ function renderProgress() {
   }
 
   // график веса (SVG)
-  $("#weightChart").innerHTML = weights.length >= 2 ? weightChartSvg(weights) : "";
+  renderForecast(weights);
+  Charts.weight($("#weightChart"), weights, num(s.goalWeight), { slope: weightTrend(weights), target: forecastTargetIso });
 
   // график калорий
   const days = [];
   for (let i = 13; i >= 0; i--) days.push(shiftDate(todayStr(), -i));
   const vals = days.map(d => Math.round(sum(foodsFor(d), "cal")));
-  $("#calChart").innerHTML = calChartSvg(days, vals, num(s.goalCal));
+  Charts.calories($("#calChart"), days, vals, num(s.goalCal));
   $("#goalCalLabel").textContent = num(s.goalCal) ? `${s.goalCal} ккал` : "не задана (укажи в настройках)";
 
-  renderForecast(weights);
   renderWeekly(days, vals);
   renderStats();
   renderRecords();
@@ -1807,51 +1933,26 @@ function renderProgress() {
     : emptyScene("Записей веса пока нет", "Взвесьтесь и сохраните первую запись — появятся график и прогноз");
 }
 
-function weightChartSvg(weights) {
-  const w = 640, h = 200, pad = 34;
-  const kg = weights.map(x => x.kg);
-  let min = Math.min(...kg), max = Math.max(...kg);
-  if (max - min < 1) { min -= 0.5; max += 0.5; }
-  const span = max - min;
-  const X = i => pad + (weights.length === 1 ? 0 : i * (w - pad * 2) / (weights.length - 1));
-  const Y = v => h - pad - (v - min) / span * (h - pad * 2);
-  const pts = weights.map((x, i) => `${X(i).toFixed(1)},${Y(x.kg).toFixed(1)}`).join(" ");
-  const area = `${pad},${h - pad} ${pts} ${X(weights.length - 1).toFixed(1)},${h - pad}`;
-  const labels = weights.length > 1 ? [0, Math.floor(weights.length / 2), weights.length - 1].map(i => `
-    <text x="${X(i)}" y="${h - 10}" fill="#8ba3c4" font-size="11" text-anchor="${i === 0 ? "start" : i === weights.length - 1 ? "end" : "middle"}">${fmtDateShort(weights[i].date)}</text>`).join("") : "";
-  const goal = num(data.settings.goalWeight);
-  const goalLine = goal && goal >= min && goal <= max ? `<line x1="${pad}" x2="${w - pad}" y1="${Y(goal)}" y2="${Y(goal)}" stroke="#3fd08a" stroke-dasharray="5 5" stroke-width="1.5"/><text x="${w - pad}" y="${Y(goal) - 6}" fill="#3fd08a" font-size="11" text-anchor="end">цель ${goal} кг</text>` : "";
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">
-    <polyline points="${area}" fill="rgba(77,163,255,.12)" stroke="none"/>
-    <line x1="${pad}" x2="${w - pad}" y1="${Y(max + span * .05)}" y2="${Y(max + span * .05)}" stroke="#1e3150"/>
-    <polyline points="${pts}" fill="none" stroke="#4da3ff" stroke-width="2.5" stroke-linejoin="round"/>
-    ${weights.map((x, i) => `<circle cx="${X(i)}" cy="${Y(x.kg)}" r="3.5" fill="#4da3ff"/>`).join("")}
-    ${goalLine}${labels}
-    <text x="${pad}" y="${Y(max) - 6}" fill="#8ba3c4" font-size="11">${max.toFixed(1)} кг</text>
-    <text x="${pad}" y="${Y(min) + 16}" fill="#8ba3c4" font-size="11">${min.toFixed(1)} кг</text>
-  </svg>`;
+// Тренд веса (кг/день): регрессия по последним 4 неделям, если там хватает записей, иначе по всей истории.
+// Вся история даёт «горбы» и неверный наклон, когда вес то рос, то падал.
+function weightTrend(weights) {
+  if (!weights || weights.length < 3) return null;
+  const dayMs = 86400000;
+  const lastD = weights[weights.length - 1].date;
+  if ((new Date(lastD) - new Date(weights[0].date)) / dayMs < 7) return null;
+  const from = shiftDate(lastD, -28);
+  const recent = weights.filter(w => w.date >= from);
+  const fw = recent.length >= 4 ? recent : weights;
+  const t0 = new Date(fw[0].date);
+  const xs = fw.map(x => (new Date(x.date) - t0) / dayMs), ys = fw.map(x => x.kg);
+  const n = fw.length, mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
+  const den = xs.reduce((s2, x) => s2 + (x - mx) ** 2, 0);
+  return den ? xs.reduce((s2, x, i) => s2 + (x - mx) * (ys[i] - my), 0) / den : 0;
 }
-
-function calChartSvg(days, vals, goal) {
-  const w = 640, h = 200, pad = 34;
-  const maxV = Math.max(goal || 0, ...vals, 500);
-  const bw = (w - pad * 2) / days.length * 0.62;
-  const step = (w - pad * 2) / days.length;
-  const Y = v => h - pad - v / maxV * (h - pad * 2);
-  const goalLine = goal ? `<line x1="${pad}" x2="${w - pad}" y1="${Y(goal)}" y2="${Y(goal)}" stroke="#3fd08a" stroke-dasharray="5 5" stroke-width="1.5"/><text x="${w - pad}" y="${Y(goal) - 5}" fill="#3fd08a" font-size="11" text-anchor="end">цель</text>` : "";
-  const bars = days.map((d, i) => {
-    const v = vals[i];
-    const x = pad + i * step + (step - bw) / 2;
-    const y = Y(v);
-    const col = v ? (goal && v > goal ? "#e0684f" : "#4da3ff") : "#22314e";
-    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${(h - pad - y).toFixed(1)}" rx="3" fill="${col}"/>`;
-  }).join("");
-  const labels = [0, Math.floor(days.length / 2), days.length - 1].map(i => `
-    <text x="${pad + i * step + step / 2}" y="${h - 10}" fill="#8ba3c4" font-size="11" text-anchor="middle">${fmtDateShort(days[i])}</text>`).join("");
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">${bars}${goalLine}${labels}</svg>`;
-}
+let forecastTargetIso = null; // дата достижения цели (для пунктира на графике веса)
 
 function renderForecast(weights) {
+  forecastTargetIso = null;
   const el = $("#forecastPanel");
   const s = data.settings;
   const goal = num(s.goalWeight);
@@ -1873,12 +1974,7 @@ function renderForecast(weights) {
       <div class="sub">Записывайте вес хотя бы неделю — тогда появится прогноз.</div>`;
     return;
   }
-  // линейная регрессия
-  const n = weights.length;
-  const xs = weights.map(x => (new Date(x.date) - new Date(first.date)) / dayMs);
-  const ys = weights.map(x => x.kg);
-  const mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
-  const slope = xs.reduce((s2, x, i) => s2 + (x - mx) * (ys[i] - my), 0) / xs.reduce((s2, x) => s2 + (x - mx) ** 2, 0);
+  const slope = weightTrend(weights);
   const cur = last.kg;
   const diff = cur - goal;
   const perWeek = slope * 7;
@@ -1899,6 +1995,7 @@ function renderForecast(weights) {
       html += `<div class="big">Цель достижима, но не скоро</div><div class="sub">С текущим темпом (${fmtNum(Math.abs(perWeek))} кг в неделю) до цели ${goal} кг уйдёт больше двух лет — чуть скорректируйте план, и получится быстрее.${staleNote}</div>`;
     } else {
       const target = new Date(); target.setDate(target.getDate() + Math.round(daysToGoal));
+      forecastTargetIso = shiftDate(todayStr(), Math.round(daysToGoal));
       html += `<div class="big">С таким темпом вы достигнете цели ${goal} кг к ${fmtDateRu(target.toISOString().slice(0, 10))}</div>
         <div class="sub">Темп: ${fmtNum(Math.abs(perWeek))} кг в неделю. Прогноз приблизительный: он просто продлевает текущую динамику вперёд.${staleNote}</div>`;
     }
@@ -2083,21 +2180,22 @@ function loaderHistory(name) {
   data.workouts.forEach(w => {
     workoutExercises(w).forEach(ex => {
       if (normExName(ex.name) !== n || !ex.sets || !ex.sets.length) return;
-      const best = ex.sets.reduce((b, s) => {
-        const wgt = num(s.weight), reps = parseFloat(String(s.reps || "").replace(",", ".")) || 0;
-        return wgt > b.kg ? { kg: wgt, reps, vol: wgt * reps } : b;
-      }, { kg: 0, reps: 0, vol: 0 });
-      pts.push({ date: w.date, kg: best.kg, reps: best.reps, vol: best.vol });
+      const sets = ex.sets.map(s => ({ wgt: num(s.weight), reps: parseFloat(String(s.reps || "").replace(",", ".")) || 0 }));
+      const valid = sets.filter(s => s.wgt > 0 && s.reps >= 1); // подходы «105 × 0» не считаем
+      const best = (valid.length ? valid : sets).reduce((b, s) => (s.wgt > b.kg ? { kg: s.wgt, reps: s.reps, vol: s.wgt * s.reps } : b), { kg: 0, reps: 0, vol: 0 });
+      const e1 = valid.reduce((m, s) => Math.max(m, e1rm(s.wgt, s.reps)), 0);
+      pts.push({ date: w.date, kg: best.kg, reps: best.reps, vol: best.vol, e1 });
     });
   });
   return pts.sort((a, b) => a.date.localeCompare(b.date));
 }
 
-// Оценка 1ПМ по формуле Брызки: weight × (36 / (36 - reps)) — точнее для малых повторов
+// Оценка 1ПМ по формуле Брызки: weight × 36 / (37 − reps); для 1 повтора даёт ровно вес
 function e1rm(kg, reps) {
-  if (kg <= 0 || reps <= 0 || reps >= 36) return 0;
-  return Math.round(kg * (36 / (36 - reps)) * 10) / 10;
+  if (kg <= 0 || reps <= 0 || reps >= 37) return 0;
+  return Math.round(kg * 36 / (37 - reps) * 10) / 10;
 }
+function e1of(p) { return p.e1 != null ? p.e1 : e1rm(p.kg, p.reps); }
 
 // вес тела на дату (последняя запись не позже date)
 function bodyWeightAt(date) {
@@ -2123,30 +2221,6 @@ function bestSetFor(exName, wid) {
   return best;
 }
 
-// график: синяя — лучший вес подхода, фиолетовый пунктир — 1ПМ
-function loadChartSvg(pts) {
-  const w = 640, h = 210, pad = 36;
-  const withKg = pts.filter(p => p.kg > 0);
-  const e1s = pts.map(p => e1rm(p.kg, p.reps)).filter(v => v > 0);
-  let min = Math.min(...withKg.map(p => p.kg), ...e1s), max = Math.max(...withKg.map(p => p.kg), ...e1s);
-  if (max - min < 2) { min -= 1; max += 1; }
-  const span = max - min;
-  const X = i => pad + i * (w - pad * 2) / Math.max(1, pts.length - 1);
-  const Y = v => h - pad - (v - min) / span * (h - pad * 2);
-  const bestLine = pts.map((p, i) => `${X(i).toFixed(1)},${Y(Math.max(p.kg, min)).toFixed(1)}`).join(" ");
-  const e1Line = pts.map((p, i) => `${X(i).toFixed(1)},${Y(Math.max(e1rm(p.kg, p.reps), min)).toFixed(1)}`).join(" ");
-  const area = `${pad},${h - pad} ${bestLine} ${X(pts.length - 1).toFixed(1)},${h - pad}`;
-  const labels = [0, Math.floor(pts.length / 2), pts.length - 1].map(i => `<text x="${X(i)}" y="${h - 8}" fill="#8ba3c4" font-size="10" text-anchor="${i === 0 ? "start" : i === pts.length - 1 ? "end" : "middle"}">${fmtDateShort(pts[i].date)}</text>`).join("");
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">
-    <polyline points="${area}" fill="rgba(77,163,255,.10)" stroke="none"/>
-    <polyline points="${e1Line}" fill="none" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="5 4"/>
-    <polyline points="${bestLine}" fill="none" stroke="#4da3ff" stroke-width="2.5" stroke-linejoin="round"/>
-    ${pts.map((p, i) => `<circle cx="${X(i)}" cy="${Y(Math.max(p.kg, min))}" r="3.5" fill="#4da3ff"/><circle cx="${X(i)}" cy="${Y(Math.max(e1rm(p.kg, p.reps), min))}" r="2.5" fill="#8b5cf6"/>`).join("")}
-    <text x="${pad}" y="${Y(max) - 8}" fill="#8ba3c4" font-size="10">${fmtNum(max)} кг</text>
-    <text x="${pad}" y="${Y(min) + 18}" fill="#8ba3c4" font-size="10">${fmtNum(min)} кг</text>
-    ${labels}</svg>`;
-}
-
 // все подходы упражнения за конкретную дату (для таблицы)
 function setsForDate(exName, date) {
   const n = normExName(exName);
@@ -2163,29 +2237,30 @@ function drawLoadDetail(cur) {
   const pts = loaderHistory(cur);
   const withKg = pts.filter(p => p.kg > 0);
   const withKgAndReps = withKg.filter(p => p.reps >= 1);
-  const bestP = withKg.reduce((b, p) => (p.kg > b.kg ? p : b), { kg: 0, reps: 0, date: "" });
+  const bestP = (withKgAndReps.length ? withKgAndReps : withKg).reduce((b, p) => (p.kg > b.kg ? p : b), { kg: 0, reps: 0, date: "" });
   // 1ПМ считаем от ЛУЧШЕГО подхода с reps >= 1 (чтобы 105×0 не давал 1ПМ = 0)
   const bestFor1pm = withKgAndReps.reduce((b, p) => {
-    const e1b = e1rm(b.kg, b.reps);
-    const ep = e1rm(p.kg, p.reps);
+    const e1b = e1of(b);
+    const ep = e1of(p);
     return ep > e1b ? p : b;
   }, { kg: 0, reps: 0, date: "" });
-  const e1last = bestFor1pm.reps >= 1 ? e1rm(bestFor1pm.kg, bestFor1pm.reps) : 0;
+  const e1last = e1of(bestFor1pm);
   const firstWithReps = withKgAndReps[0] || { kg: 0, reps: 0 };
-  const e1first = firstWithReps.kg ? e1rm(firstWithReps.kg, firstWithReps.reps) : 0;
+  const e1first = firstWithReps.kg ? e1of(firstWithReps) : 0;
   const growth = e1last && e1first ? Math.round((e1last - e1first) * 10) / 10 : 0;
   const statsEl = $("#loadStats"), chartEl = $("#loadChart"), legEl = $("#loadLegend"), tblEl = $("#loadTable");
   if (!statsEl) return;
-  statsEl.innerHTML = `<div class="card"><span>Лучший подход</span><strong>${bestP.kg ? `${fmtNum(bestP.kg)} кг × ${bestP.reps}` : "—"}</strong><small>${bestP.date || ""}</small></div>
+  statsEl.innerHTML = `<div class="card"><span>Лучший подход</span><strong>${bestP.kg ? `${fmtNum(bestP.kg)} кг × ${bestP.reps}` : "—"}</strong><small>${bestP.date ? fmtDateRu(bestP.date) : ""}</small></div>
     <div class="card"><span>1ПМ сейчас</span><strong>${e1last ? fmtNum(e1last) + " кг" : "—"}</strong><small>расчётный максимум на 1 повтор</small></div>
     <div class="card"><span>Рост с первой записи</span><strong style="color:${growth > 0.4 ? "var(--green)" : growth < -0.4 ? "var(--danger)" : ""}">${growth > 0 ? "+" : ""}${fmtNum(growth)} кг</strong><small>по 1ПМ</small></div>`;
   const ready = withKg.length >= 2;
-  chartEl.innerHTML = ready ? loadChartSvg(pts) : `<div class="empty">${pts.length < 2 ? "Нужно минимум 2 тренировки с этим упражнением." : "Здесь только подходы с собственным весом."}</div>`;
-  legEl.innerHTML = ready ? `<div class="hint" style="margin-top:6px">Синяя линия — лучший вес подхода · фиолетовая пунктирная — 1ПМ (как бы тянул на 1 повтор)</div><div class="btn-row" style="margin-top:8px"><button class="small ghost" data-action="showLoadDetail" data-name="${esc(cur)}">📊 Показать всю историю</button></div>` : "";
+  if (ready) Charts.load(chartEl, pts); else { Charts.dispose(chartEl); chartEl.innerHTML = `<div class="empty">${pts.length < 2 ? "Нужно минимум 2 тренировки с этим упражнением." : "Здесь только подходы с собственным весом."}</div>`; }
+  legEl.innerHTML = ready ? `<div class="hint" style="margin-top:6px">Фиолетовая линия — расчётный 1ПМ (максимум на 1 повтор) · синий пунктир — вес самого тяжёлого подхода · зелёные кружки — новые рекорды</div><div class="btn-row" style="margin-top:8px"><button class="small ghost" data-action="showLoadDetail" data-name="${esc(cur)}">📊 Показать всю историю</button></div>` : "";
+  const rows = pts.slice(-8).reverse();
   tblEl.innerHTML = rows.length ? `<div class="list">${rows.map(p => `
     <div class="item"><div class="item-main"><div class="name">${fmtDateRu(p.date)}</div>
       <small>${esc(setsForDate(cur, p.date)) || "подходы не записаны"}</small></div>
-      <span class="kcal">${p.kg ? fmtNum(p.kg) + " кг × " + p.reps : p.reps + "×"}${bestP.kg && p.kg === bestP.kg ? " 🏆" : ""}<br><small style="color:#8ba3c4">1ПМ ${e1rm(p.kg, p.reps) ? fmtNum(e1rm(p.kg, p.reps)) : "—"}</small></span></div>`).join("")}</div>` : "";
+      <span class="kcal">${p.kg ? fmtNum(p.kg) + " кг × " + p.reps : p.reps + "×"}${bestP.kg && p.kg === bestP.kg ? " 🏆" : ""}<br><small style="color:#8ba3c4">1ПМ ${e1of(p) ? fmtNum(e1of(p)) : "—"}</small></span></div>`).join("")}</div>` : "";
 }
 
 /* ---------- Модальное окно полной истории нагрузки ---------- */
@@ -2807,21 +2882,77 @@ const actions = {
     const w = data.workouts.find(x => x.id === el.dataset.id);
     const i = +el.dataset.i;
     if (!w || !w.exercises || !w.exercises[i]) return;
-    const ex = w.exercises[i];
-    if (ex.ssGroup) {
+    const arr = w.exercises, ex = arr[i];
+    const run = runOf(arr, i);
+    if (run.end > run.start) {
+      // убрать из суперсета; упражнение встаёт сразу за группу, чтобы остальные остались вместе
       delete ex.ssGroup;
+      if (i < run.end) { arr.splice(i, 1); arr.splice(run.end, 0, ex); }
     } else {
-      // Если предыдущее упражнение уже в суперсете — добавляем его в ту же группу
-      const prev = w.exercises[i - 1];
-      if (prev && prev.ssGroup) {
-        ex.ssGroup = prev.ssGroup;
-      } else {
-        // Новая группа — создаём уникальное значение на основе индекса
-        // Нормализация в renderTrainingSession переназначит это на 1, 2, 3...
-        ex.ssGroup = 'ss-' + i;
-      }
+      const prev = arr[i - 1];
+      if (!prev) { toast("Суперсет связывает упражнение с предыдущим — это первое в списке", true); return; }
+      const unitDone = k => { const r = runOf(arr, k); return arr.slice(r.start, r.end + 1).every(e => e.done); };
+      if (unitDone(i - 1) !== unitDone(i)) { toast("Нельзя связать завершённое упражнение с активным — сначала верните его в работу (↩)", true); return; }
+      const id = prev.ssGroup || ("ss-" + uid());
+      prev.ssGroup = id; ex.ssGroup = id;
     }
+    cleanGroups(arr); assignSsNumbers(arr); settleOrder(arr);
     touch(w); persist(); renderTrainingSession(w.id);
+  },
+  splitSuperset: (el) => {
+    const w = data.workouts.find(x => x.id === el.dataset.id);
+    const i = +el.dataset.i;
+    if (!w || !w.exercises || !w.exercises[i]) return;
+    const arr = w.exercises, run = runOf(arr, i);
+    if (!(i > run.start)) return;
+    const nid = "ss-" + uid();
+    for (let k = i; k <= run.end; k++) { arr[k].ssGroup = nid; delete arr[k].ssNo; }
+    cleanGroups(arr); assignSsNumbers(arr);
+    touch(w); persist(); renderTrainingSession(w.id);
+    toast("Новый суперсет начинается с «" + arr[i].name + "»");
+  },
+  setSupersets: (el) => {
+    const w = data.workouts.find(x => x.id === el.dataset.id);
+    if (!w || !w.exercises) return;
+    const arr = w.exercises;
+    const act = buildUnits(arr).filter(u => !arr.slice(u.start, u.end + 1).every(e => e.done));
+    const k = act.length ? act[act.length - 1].end + 1 : 0; // незавершённые упражнения всегда идут первыми
+    if (k < 2) { toast("Нужно минимум два незавершённых упражнения", true); return; }
+    const list = arr.slice(0, k);
+    const ans = prompt(SS_PROMPT(k), ssSizesText(list));
+    if (ans == null) return;
+    const sizes = parseSsSizes(ans);
+    if (!sizes) { toast("Введите числа через запятую, например 3,4", true); return; }
+    const sum = sizes.reduce((a, b) => a + b, 0);
+    if (sum > k) { toast(`Сумма ${sum} больше числа упражнений (${k})`, true); return; }
+    applySsSizes(list, sizes);
+    cleanGroups(arr); assignSsNumbers(arr); settleOrder(arr);
+    touch(w); persist(); renderTrainingSession(w.id);
+    toast("Суперсеты настроены ✓");
+  },
+  finishEx: (el) => {
+    const w = data.workouts.find(x => x.id === el.dataset.id);
+    const i = +el.dataset.i;
+    if (!w || !w.exercises || !w.exercises[i]) return;
+    const arr = w.exercises, ex = arr[i];
+    if (!ex.sets.length && !confirm("В этом упражнении нет записанных подходов. Всё равно завершить?")) return;
+    ex.done = true;
+    const run = runOf(arr, i);
+    const block = arr.slice(run.start, run.end + 1);
+    const allDone = block.every(e => e.done);
+    if (allDone) { arr.splice(run.start, block.length); arr.push(...block); } // уезжает в самый низ
+    settleOrder(arr);
+    touch(w); persist(); renderTrainingSession(w.id);
+    toast(allDone ? "Упражнение завершено ✓ — оно внизу списка, подходы можно поправить" : "Упражнение завершено ✓ — осталось закончить остальные в суперсете");
+  },
+  reopenEx: (el) => {
+    const w = data.workouts.find(x => x.id === el.dataset.id);
+    const i = +el.dataset.i;
+    if (!w || !w.exercises || !w.exercises[i]) return;
+    delete w.exercises[i].done;
+    settleOrder(w.exercises);
+    touch(w); persist(); renderTrainingSession(w.id);
+    toast("Упражнение снова в работе");
   },
   toggleProgressHint: (el) => {
     const w = data.workouts.find(x => x.id === el.dataset.id);
@@ -2873,6 +3004,7 @@ const actions = {
     const w = data.workouts.find(x => x.id === el.dataset.id);
     if (w && w.exercises && w.exercises[+el.dataset.i]) {
       w.exercises.splice(+el.dataset.i, 1);
+      cleanGroups(w.exercises); assignSsNumbers(w.exercises); settleOrder(w.exercises);
       touch(w); persist(); renderTrainingSession(w.id);
     }
   },
@@ -2883,6 +3015,7 @@ const actions = {
     if (!w) return;
     w.exercises = workoutExercises(w);
     w.exercises.push({ name: name.trim(), sets: [] });
+    settleOrder(w.exercises); // новое упражнение — в конец активных, выше завершённых
     touch(w); persist(); renderTrainingSession(w.id);
   },
   finishWorkout: (el) => finishWorkout(el.dataset.id),
@@ -3005,34 +3138,19 @@ const actions = {
   exportData: () => {
     const payload = JSON.parse(JSON.stringify(data));
     payload.settings = { ...payload.settings, geminiKey: "", openaiKey: "", firebaseConfig: "" }; // ключи в экспорт не включаем
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `dnevnik-zdorovia-${todayStr()}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast("Файл с данными скачан");
+    saveFile(`dnevnik-zdorovia-${todayStr()}.json`, JSON.stringify(payload, null, 2), "application/json");
+    toast("Файл с данными готов");
   },
   exportCsv: () => {
     const csv = buildCsvRows(data);
-    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" }); // BOM — чтобы Excel видел кириллицу
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `dnevnik-zdorovia-${todayStr()}.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast("CSV для Excel скачан");
+    saveFile(`dnevnik-zdorovia-${todayStr()}.csv`, "\uFEFF" + csv, "text/csv;charset=utf-8"); // BOM — чтобы Excel видел кириллицу
+    toast("CSV для Excel готов");
   },
   exportXls: () => {
     if (typeof XLSX === "undefined") {
       // библиотека не загрузилась — запасной HTML-.xls
-      const blob = new Blob([buildXlsHtml(data)], { type: "application/vnd.ms-excel;charset=utf-8" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `dnevnik-zdorovia-${todayStr()}.xls`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-      toast("Excel (простая версия) скачан");
+      saveFile(`dnevnik-zdorovia-${todayStr()}.xls`, buildXlsHtml(data), "application/vnd.ms-excel;charset=utf-8");
+      toast("Excel (простая версия) готов");
       return;
     }
     const s = buildXlsxSheets(data);
@@ -3046,8 +3164,10 @@ const actions = {
     mk("Тренировки", s.woutRows, [12, 22, 70, 7, 7, 10]);
     mk("Вес", s.wRows, [12, 10]);
     mk("Прогресс", s.progRows, [22, 16, 9, 9, 12, 11, 11, 12, 14]);
-    XLSX.writeFile(wb, `dnevnik-zdorovia-${todayStr()}.xlsx`);
-    toast("Таблица .xlsx (4 листа) скачана");
+    const xlsxName = `dnevnik-zdorovia-${todayStr()}.xlsx`;
+    if (isNativeApp()) saveNative(xlsxName, XLSX.write(wb, { bookType: "xlsx", type: "base64" }), true);
+    else XLSX.writeFile(wb, xlsxName);
+    toast("Таблица .xlsx (4 листа) готова");
   },
   importData: () => {
     const inp = document.createElement("input");

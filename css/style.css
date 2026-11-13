@@ -595,3 +595,44 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .acwr-marker { position: absolute; top: -4px; width: 4px; height: 22px; border-radius: 3px; background: #fff; box-shadow: 0 0 8px rgba(255,255,255,.6); transform: translateX(-2px); transition: left .4s ease; }
 .acwr-foot { margin-top: 10px; font-size: 14px; }
 .acwr-foot b { color: #7dd3fc; }
+
+/* ---- графики (Lightweight Charts) ---- */
+.chart-wrap { overflow: visible; }
+.lwc-box { position: relative; width: 100%; touch-action: pan-y; }
+.lwc-bar { display: flex; align-items: center; gap: 6px; margin: 4px 0 8px; min-height: 30px; }
+.lwc-bar button { padding: 5px 12px; font-size: 13px; border-radius: 999px; border: 1px solid var(--border-hover); background: transparent; color: var(--text-secondary, #8ba3c4); cursor: pointer; width: auto; min-height: 0; }
+.lwc-bar button.on { background: var(--accent-gradient); color: #fff; border-color: transparent; }
+.lwc-trend { margin-left: auto; font-size: 13px; font-weight: 600; }
+.lwc-tip { position: absolute; z-index: 5; pointer-events: none; background: rgba(12,18,36,.94); border: 1px solid var(--border-hover); border-radius: 10px; padding: 6px 10px; font-size: 12px; line-height: 1.4; color: #e8eefc; white-space: nowrap; }
+
+/* ---- тренировка: перетаскивание, суперсеты, завершённые упражнения ---- */
+.ts-handle { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px; margin: -6px 2px -6px -8px; font-size: 20px; line-height: 1; color: var(--text-secondary, #8ba3c4); cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ts-handle:active { cursor: grabbing; color: #fff; }
+.ts-title { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
+.ts-unit { position: relative; }
+.ts-unit.dragging { z-index: 20; opacity: .92; box-shadow: 0 10px 30px rgba(0,0,0,.55); }
+.ts-unit.drop-before::before, .ts-unit.drop-end::after, .ex-drag.drop-before::before, .ex-drag.drop-end::after { content: ""; display: block; height: 3px; border-radius: 2px; background: var(--accent, #5b8def); margin: -6px 0 3px; }
+.ts-unit.drop-end::after, .ex-drag.drop-end::after { margin: 3px 0 -6px; }
+.ex-drag.dragging { position: relative; z-index: 20; opacity: .92; box-shadow: 0 10px 30px rgba(0,0,0,.55); }
+.ts-group { border: 1px solid rgba(139,108,246,.55); border-radius: var(--radius-sm); padding: 8px 8px 0; margin-bottom: 10px; background: rgba(139,108,246,.06); }
+.ts-group .ts-ex { margin-bottom: 8px; }
+.ts-group-head { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; flex-wrap: wrap; }
+.ts-group-head small { color: var(--text-secondary, #8ba3c4); flex-basis: 100%; }
+.ts-group-head .ts-handle { margin-left: -4px; }
+.ts-ex.done { opacity: .78; border-color: rgba(74,230,141,.35); background: rgba(74,230,141,.05); }
+.ts-done-title { margin: 14px 0 8px; font-size: 13px; font-weight: 700; color: var(--green, #4ae68d); }
+.finish-ex { width: 100%; margin-top: 8px; min-height: 42px; border-radius: var(--radius-xs); border: 1px solid rgba(74,230,141,.55); background: rgba(74,230,141,.12); color: var(--green, #4ae68d); font-weight: 700; font-size: 14px; cursor: pointer; }
+.ex-drag-head { display: flex; align-items: center; gap: 4px; }
+.ex-drag-head b { cursor: default; margin-bottom: 0; }
+
+/* ---- суперсеты: номера и цвета ---- */
+.ts-group, .ex-drag.in-ss { --ssc: #8b6cf6; }
+.ts-group[data-c="1"], .ex-drag[data-c="1"] { --ssc: #2dd4bf; }
+.ts-group[data-c="2"], .ex-drag[data-c="2"] { --ssc: #fb923c; }
+.ts-group[data-c="3"], .ex-drag[data-c="3"] { --ssc: #f472b6; }
+.ts-group { border-color: var(--ssc); background: color-mix(in srgb, var(--ssc) 8%, transparent); }
+.ts-group-head b { color: var(--ssc); font-size: 15px; }
+.ts-group-count { font-size: 12px; color: var(--text-secondary, #8ba3c4); }
+.ts-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; }
+.ex-drag.in-ss { border-left: 4px solid var(--ssc); }
+.ss-badge { background: color-mix(in srgb, var(--ssc) 22%, transparent); color: var(--ssc); border: 1px solid var(--ssc); }

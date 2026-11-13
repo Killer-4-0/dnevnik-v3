@@ -1,4 +1,4 @@
-const CACHE_NAME = "dnevnik-zdorovia-v22";
+const CACHE_NAME = "dnevnik-zdorovia-v25";
 const ASSETS = [
   "./",
   "index.html",
@@ -7,6 +7,8 @@ const ASSETS = [
   "js/db.js",
   "js/app.js",
   "js/importer.js",
+  "js/charts.js",
+  "vendor/lightweight-charts.js",
   "vendor/xlsx.full.min.js",
   "mascot/main.png",
   "mascot/hello.png",
