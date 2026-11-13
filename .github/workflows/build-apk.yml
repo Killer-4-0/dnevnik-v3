@@ -59,20 +59,11 @@ jobs:
           grep -n "versionCode\|versionName" android/app/build.gradle
 
       - name: Иконка приложения
-        continue-on-error: true
         working-directory: build
         run: |
-          IM=$(command -v magick || command -v convert)
-          R=android/app/src/main/res
-          declare -A S=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
-          declare -A F=( [mdpi]=108 [hdpi]=162 [xhdpi]=216 [xxhdpi]=324 [xxxhdpi]=432 )
-          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
-            $IM ../icons/icon-512.png -resize ${S[$d]}x${S[$d]} $R/mipmap-$d/ic_launcher.png
-            cp $R/mipmap-$d/ic_launcher.png $R/mipmap-$d/ic_launcher_round.png
-            inner=$(( ${F[$d]} * 80 / 100 ))
-            $IM ../icons/icon-maskable-512.png -resize ${inner}x${inner} -background none -gravity center -extent ${F[$d]}x${F[$d]} $R/mipmap-$d/ic_launcher_foreground.png
-          done
-          sed -i 's/#FFFFFF/#0a1628/I' $R/values/ic_launcher_background.xml
+          python3 -m venv /tmp/iconvenv
+          /tmp/iconvenv/bin/pip install --quiet pillow
+          /tmp/iconvenv/bin/python ../apk/make_icons.py android/app/src/main/res
 
       - name: Собрать APK
         working-directory: build/android
