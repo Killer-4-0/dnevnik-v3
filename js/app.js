@@ -1889,7 +1889,19 @@ function loadSamplePlans() {
 /* ================= ПРОГРЕСС ================= */
 function sortedWeights() { return [...data.weights].sort((a, b) => a.date.localeCompare(b.date) || a.createdAt - b.createdAt); }
 
+// Каждый блок «Прогресса» рисуется отдельно: сбой в одном не должен оставлять пустыми остальные
+let progErrShown = false;
+function safeRun(label, fn, el) {
+  try { fn(); } catch (e) {
+    console.error("[" + label + "]", e);
+    const msg = String((e && e.message) || e);
+    if (el) el.innerHTML = `<div class="empty">Не удалось построить блок «${esc(label)}»: ${esc(msg)}</div>`;
+    if (!progErrShown) { progErrShown = true; toast(`Ошибка в блоке «${label}»: ${msg}`, true); }
+  }
+}
+
 function renderProgress() {
+  progErrShown = false;
   const weights = sortedWeights();
   const s = data.settings;
 
@@ -1907,23 +1919,23 @@ function renderProgress() {
   }
 
   // график веса (SVG)
-  renderForecast(weights);
-  Charts.weight($("#weightChart"), weights, num(s.goalWeight), { slope: weightTrend(weights), target: forecastTargetIso });
+  safeRun("прогноз", () => renderForecast(weights), $("#forecastPanel"));
+  safeRun("график веса", () => Charts.weight($("#weightChart"), weights, num(s.goalWeight), { slope: weightTrend(weights), target: forecastTargetIso }), $("#weightChart"));
 
   // график калорий
   const days = [];
   for (let i = 13; i >= 0; i--) days.push(shiftDate(todayStr(), -i));
   const vals = days.map(d => Math.round(sum(foodsFor(d), "cal")));
-  Charts.calories($("#calChart"), days, vals, num(s.goalCal));
   $("#goalCalLabel").textContent = num(s.goalCal) ? `${s.goalCal} ккал` : "не задана (укажи в настройках)";
+  safeRun("график калорий", () => Charts.calories($("#calChart"), days, vals, num(s.goalCal)), $("#calChart"));
 
-  renderWeekly(days, vals);
-  renderStats();
-  renderRecords();
-  renderAcwr();
-  renderRadar();
-  renderGoalBanner(weights);
-  if (progTab === "loads") renderLoads();
+  safeRun("итоги недели", () => renderWeekly(days, vals));
+  safeRun("сводка", () => renderStats());
+  safeRun("рекорды", () => renderRecords());
+  safeRun("нагрузка и восстановление", () => renderAcwr());
+  safeRun("баланс групп", () => renderRadar());
+  safeRun("баннер цели", () => renderGoalBanner(weights));
+  if (progTab === "loads") safeRun("графики нагрузок", () => renderLoads());
 
   // история веса
   const recent = [...weights].reverse().slice(0, 10);
@@ -3180,8 +3192,14 @@ const actions = {
           const imported = JSON.parse(r.result);
           if (!imported || typeof imported !== "object" || !("foods" in imported)) throw new Error("format");
           mergeCloud(imported);
+          if (imported.settings && typeof imported.settings === "object") {
+            const cs = { ...imported.settings };
+            delete cs.openaiKey; delete cs.geminiKey; delete cs.firebaseConfig; // ключи не переносим
+            Object.assign(data.settings, cs);
+          }
           persist(); renderAll();
-          toast("Данные импортированы");
+          const cnt = a => (Array.isArray(a) ? a.length : 0);
+          toast(`Импортировано: питание ${cnt(imported.foods)}, вес ${cnt(imported.weights)}, тренировки ${cnt(imported.workouts)}, планы ${cnt(imported.plans)}`);
         } catch { toast("Не удалось прочитать файл — это экспорт этого приложения?", true); }
       };
       r.readAsText(file);
