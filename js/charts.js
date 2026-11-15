@@ -1,9 +1,10 @@
-/* Графики на TradingView Lightweight Charts v4 (vendor/lightweight-charts.js).
+/* === ГРАФИКИ (встроены в app.js, чтобы не зависеть от отдельных <script>-тегов) ===
+   TradingView Lightweight Charts v4 (vendor/lightweight-charts.js), при сбое — простой SVG.
    API: Charts.weight(el, weights, goal) · Charts.calories(el, days, vals, goal)
         Charts.load(el, pts) · Charts.dispose(el) */
 (function () {
   "use strict";
-  const LW = window.LightweightCharts;
+  const lw = () => window.LightweightCharts; // библиотека может подгрузиться позже
   const COL = {
     text: "#8ba3c4", grid: "rgba(139,163,196,.09)", cross: "rgba(139,163,196,.4)",
     blue: "#4da3ff", violet: "#8b6cf6", green: "#4ae68d", red: "#ff6b7a", muted: "#22314e"
@@ -40,6 +41,7 @@
 
   function make(el, height, opts) {
     dispose(el);
+    const LW = lw();
     if (!LW) throw new Error("библиотека графиков не загрузилась");
     const bar = document.createElement("div");
     bar.className = "lwc-bar";
@@ -333,4 +335,12 @@
   }
 
   window.Charts = { weight, calories, load, dispose, _movingAvg: movingAvg };
+
+  // Если в index.html нет тега с библиотекой — подгружаем сами и перерисовываем «Прогресс»
+  if (!lw() && typeof document !== "undefined") {
+    const sc = document.createElement("script");
+    sc.src = "vendor/lightweight-charts.js";
+    sc.onload = () => { try { if (typeof renderProgress === "function") renderProgress(); } catch (_) { /* не критично */ } };
+    (document.head || document.documentElement).appendChild(sc);
+  }
 })();
