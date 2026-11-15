@@ -906,7 +906,7 @@ function renderFoodSearch(tab) {
       <button data-stab="search" class="${tab === "search" ? "active" : ""}">Поиск</button>
       <button data-stab="custom" class="${tab === "custom" ? "active" : ""}">Мои блюда</button>
       <button data-stab="barcode" class="${tab === "barcode" ? "active" : ""}">Штрихкод</button>
-      <button data-stab="photo" class="${tab === "photo" ? "active" : ""}">Фото</button>
+      <button data-stab="photo" class="${tab === "photo" ? "active" : ""}">✨ ИИ</button>
     </div>
     <div id="foodSearchBody"></div>`;
   openModal(html);
@@ -946,14 +946,7 @@ function renderFoodSearch(tab) {
     $("#barcodeInput").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); doBarcodeLookup($("#barcodeInput").value.trim()); } });
   }
 
-  if (tab === "photo") {
-    body.innerHTML = `
-      <div class="empty" style="padding:24px 0;text-align:center">
-        <div style="font-size:34px;margin-bottom:8px">📷</div>
-        <div style="font-size:16px;font-weight:600;margin-bottom:6px">Не реализовано</div>
-        <div class="hint" style="margin:0">Распознавание еды по фото пока не работает. Добавляйте еду через поиск, голос или вручную.</div>
-      </div>`;
-  }
+  if (tab === "photo") renderAiFoodTab(body);
 }
 
 function localFoodResults(q) {
@@ -1319,7 +1312,7 @@ function openVoice() {
       <div class="voice-text" id="voiceText">Нажмите на микрофон и скажите, например:<br>«запиши на обед двести граммов гречки и куриную грудку»</div>
       <div id="voiceItems"></div>
       <div class="btn-row"><button data-action="addVoiceItems" disabled>Добавить в дневник</button></div>`
-    : `<div class="empty">Голосовой ввод не поддерживается этим браузером. На Android попробуйте Chrome, на компьютере — Chrome или Edge. Можно пользоваться поиском и фото.</div>`}
+    : `<div class="empty">Голосовой ввод не поддерживается этим браузером. На Android попробуйте Chrome, на компьютере — Chrome или Edge. Можно описать еду словами или сфотографировать её во вкладке «✨ ИИ» в окне поиска еды.</div>`}
   `);
   if (!SR) return;
   $("[data-action=toggleMic]").addEventListener("click", startVoiceRec);
@@ -2238,6 +2231,243 @@ function loadSamplePlans() {
 /* ================= ПРОГРЕСС ================= */
 function sortedWeights() { return [...data.weights].sort((a, b) => a.date.localeCompare(b.date) || a.createdAt - b.createdAt); }
 
+/* ================= ИИ-помощник (любой OpenAI-совместимый API) =================
+   Настройки: адрес API, ключ, модель. В APK запросы идут через нативный HTTP Capacitor (без CORS),
+   в браузере — обычный fetch (может блокироваться CORS на стороне сервиса). Ключ хранится только на устройстве. */
+let aiPhotoData = null, aiFoodItems = [], aiCoachHistory = [];
+
+function aiConfigured() { const s = data.settings; return !!(s.aiBase && s.aiKey && s.aiModel); }
+
+async function aiHttpPost(url, headers, bodyObj) {
+  const cap = window.Capacitor, http = cap && cap.Plugins && cap.Plugins.CapacitorHttp;
+  if (cap && typeof cap.isNativePlatform === "function" && cap.isNativePlatform() && http) {
+    const r = await http.request({ url, method: "POST", headers, data: bodyObj, connectTimeout: 20000, readTimeout: 90000 });
+    return { status: r.status, json: typeof r.data === "string" ? (() => { try { return JSON.parse(r.data); } catch { return null; } })() : r.data, text: typeof r.data === "string" ? r.data : JSON.stringify(r.data) };
+  }
+  const r = await Promise.race([
+    fetch(url, { method: "POST", headers, body: JSON.stringify(bodyObj) }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("нет ответа от сервера за 90 секунд")), 90000))
+  ]);
+  const text = await r.text();
+  let json = null; try { json = JSON.parse(text); } catch { /* не JSON */ }
+  return { status: r.status, json, text };
+}
+
+async function aiChat(messages) {
+  const s = data.settings;
+  if (!aiConfigured()) throw new Error("ИИ не настроен: укажите адрес API, ключ и модель (Ещё → ИИ-помощник)");
+  let base = String(s.aiBase).trim().replace(/\/+$/, "");
+  const url = /\/chat\/completions$/.test(base) ? base : base + "/chat/completions";
+  let r;
+  try {
+    r = await aiHttpPost(url, { "Content-Type": "application/json", "Authorization": "Bearer " + String(s.aiKey).trim() }, { model: s.aiModel, messages });
+  } catch (e) {
+    throw new Error("не удалось связаться с сервером ИИ (" + String((e && e.message) || e) + "). Проверьте интернет и адрес API");
+  }
+  if (r.status < 200 || r.status >= 300) {
+    const j = r.json, em = j && (typeof j.error === "string" ? j.error : (j.error && j.error.message) || j.message || j.detail);
+    const hint = r.status === 401 || r.status === 403 ? " — проверьте ключ" : r.status === 404 ? " — проверьте адрес API и название модели" : r.status === 429 ? " — превышен лимит запросов" : "";
+    throw new Error(`ошибка ${r.status}${hint}${em ? ": " + String(em).slice(0, 160) : ""}`);
+  }
+  const msg = r.json && r.json.choices && r.json.choices[0] && r.json.choices[0].message;
+  let out = msg && msg.content;
+  if (Array.isArray(out)) out = out.map(p => (p && p.text) || "").join("");
+  if (!out) throw new Error("пустой ответ от ИИ");
+  return String(out);
+}
+
+function aiParseJson(text) {
+  let t = String(text).replace(/```json|```/gi, "").trim();
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a >= 0 && b > a) t = t.slice(a, b + 1);
+  return JSON.parse(t);
+}
+
+function aiMdLite(text) { // безопасное мини-форматирование ответа
+  return esc(text).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/^#{1,4}\s*(.+)$/gm, "<b>$1</b>").replace(/\n/g, "<br>");
+}
+
+/* ---------- интерфейс: настройки и кнопка в «Прогрессе» (создаются кодом, чтобы не зависеть от index.html) ---------- */
+function ensureAiUi() {
+  if (!$("#aiSection")) {
+    const anchor = $("[data-action=exportData]");
+    const sec = anchor && anchor.closest(".settings-section");
+    if (sec) sec.insertAdjacentHTML("beforebegin", `<div class="settings-section" id="aiSection"></div>`);
+  }
+  if (!$("#aiCoachPanel")) {
+    const po = $("#progOverview");
+    if (po) po.insertAdjacentHTML("afterbegin", `<div class="panel" id="aiCoachPanel"><div class="section-title">ИИ-тренер ✨</div><div class="hint" style="margin:0 0 8px">Разбор недели по вашим данным: питание, тренировки, вес.</div><div class="btn-row" style="margin-top:0"><button data-action="aiCoach">✨ Разбор моей недели</button></div></div>`);
+  }
+}
+function renderAiSection() {
+  const el = $("#aiSection");
+  if (!el || (document.activeElement && el.contains(document.activeElement))) return;
+  const s = data.settings;
+  el.innerHTML = `<div class="panel">
+    <div class="section-title">ИИ-помощник ✨</div>
+    <div class="hint" style="margin:0 0 8px">Распознавание еды по фото и тексту, разбор недели. Подойдёт любой сервис с OpenAI-совместимым API. Ключ хранится только на этом устройстве и не попадает в экспорт.</div>
+    <label class="field">Адрес API (base URL)<input id="aiBase" placeholder="например: https://api.example.com/v1" value="${esc(s.aiBase || "")}" autocomplete="off" autocapitalize="off"></label>
+    <label class="field">Ключ API<input id="aiKey" type="password" placeholder="${s.aiKey ? "сохранён (оставьте пустым, чтобы не менять)" : "вставьте ключ"}" autocomplete="off"></label>
+    <label class="field">Модель<input id="aiModel" placeholder="название модели из кабинета сервиса" value="${esc(s.aiModel || "")}" autocomplete="off" autocapitalize="off"></label>
+    <label class="field" style="display:flex;gap:8px;align-items:center;flex-direction:row"><input type="checkbox" id="aiVision" style="width:18px;min-height:0" ${s.aiVision ? "checked" : ""}> Модель умеет читать фото</label>
+    <div class="btn-row"><button data-action="aiSave">Сохранить</button><button class="ghost" data-action="aiTest">Проверить связь</button></div>
+    <div class="hint" id="aiStatus" style="margin-top:6px"></div>
+  </div>`;
+}
+
+/* ---------- вкладка «✨ ИИ» в добавлении еды ---------- */
+function renderAiFoodTab(body) {
+  if (!aiConfigured()) {
+    body.innerHTML = `<div class="empty" style="padding:20px 0;text-align:center"><div style="font-size:30px;margin-bottom:8px">✨</div><div style="font-size:16px;font-weight:600;margin-bottom:6px">ИИ ещё не настроен</div><div class="hint" style="margin:0 0 12px">Укажите адрес API, ключ и модель в настройках.</div><button data-action="aiGoSettings">Открыть настройки ИИ</button></div>`;
+    return;
+  }
+  const names = data.settings.mealNames.length ? data.settings.mealNames : ["Завтрак", "Обед", "Ужин", "Перекус"];
+  aiPhotoData = null; aiFoodItems = [];
+  body.innerHTML = `
+    <p class="hint" style="margin:0 0 8px">Сфотографируйте блюдо или опишите словами. ИИ оценит продукты, порции и КБЖУ, а вы сможете поправить граммы перед добавлением. Оценка приблизительная.</p>
+    <label class="field">Приём пищи<select id="aiMeal">${names.map(n => `<option${n === foodSearchCtx.meal ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+    <div class="btn-row"><button class="ghost" data-action="aiPickPhoto">📷 Фото блюда</button></div>
+    <input type="file" id="aiPhotoInput" accept="image/*" hidden>
+    <div id="aiPhotoPreview"></div>
+    <label class="field">Или опишите словами<textarea id="aiFoodText" placeholder="например: тарелка гречки с куриной грудкой и огурец" style="min-height:70px"></textarea></label>
+    <div class="btn-row"><button data-action="aiFoodRun">✨ Распознать</button></div>
+    <div id="aiFoodResult"></div>`;
+  $("#aiPhotoInput").addEventListener("change", e => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    aiResizeImage(f).then(url => {
+      aiPhotoData = url;
+      $("#aiPhotoPreview").innerHTML = `<img src="${url}" alt="" style="max-width:100%;max-height:180px;border-radius:10px;margin:6px 0">`;
+    }).catch(() => toast("Не удалось открыть фото", true));
+  });
+}
+function aiResizeImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, 1024 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL("image/jpeg", 0.8));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("img")); };
+    img.src = url;
+  });
+}
+const AI_FOOD_PROMPT = `Ты помощник по питанию. Определи, какие продукты и блюда съел пользователь (по фото и/или описанию), оцени вес порции в граммах и КБЖУ на ВСЮ порцию.
+Ответь ТОЛЬКО JSON без пояснений в формате:
+{"items":[{"name":"название по-русски","grams":число,"cal":число,"p":число,"f":число,"c":число}]}
+cal — ккал, p/f/c — граммы белков/жиров/углеводов, всё на всю порцию, а не на 100 г. Если не уверен — оцени примерно. Раздели блюдо на отдельные продукты, если это возможно.`;
+
+async function aiFoodRun() {
+  const text = ($("#aiFoodText").value || "").trim();
+  if (!aiPhotoData && !text) { toast("Добавьте фото или описание", true); return; }
+  if (aiPhotoData && !data.settings.aiVision) { toast("Включите «Модель умеет читать фото» в настройках ИИ или опишите еду словами", true); return; }
+  const box = $("#aiFoodResult");
+  box.innerHTML = `<div class="hint">Думаю… это может занять до минуты</div>`;
+  try {
+    const content = aiPhotoData
+      ? [{ type: "text", text: text ? "Описание от пользователя: " + text : "Определи еду на фото." }, { type: "image_url", image_url: { url: aiPhotoData } }]
+      : text;
+    const out = await aiChat([{ role: "system", content: AI_FOOD_PROMPT }, { role: "user", content }]);
+    const j = aiParseJson(out);
+    const arr = Array.isArray(j) ? j : j.items;
+    aiFoodItems = (arr || []).map(it => {
+      const grams = Math.max(1, Math.round(num(it.grams) || 100));
+      const mk = v => Math.max(0, num(v)) / grams * 100;
+      return { name: String(it.name || "Продукт").slice(0, 80), grams, per: { cal: mk(it.cal), p: mk(it.p), f: mk(it.f), c: mk(it.c) } };
+    }).filter(it => it.name);
+    if (!aiFoodItems.length) { box.innerHTML = `<div class="empty">Не удалось распознать еду. Попробуйте описать подробнее.</div>`; return; }
+    renderAiFoodItems();
+  } catch (e) {
+    box.innerHTML = `<div class="empty">Не получилось: ${esc(String((e && e.message) || e))}</div>`;
+  }
+}
+function aiItemTotals(it) { const k = it.grams / 100; return { cal: Math.round(it.per.cal * k), p: Math.round(it.per.p * k * 10) / 10, f: Math.round(it.per.f * k * 10) / 10, c: Math.round(it.per.c * k * 10) / 10 }; }
+function renderAiFoodItems() {
+  const box = $("#aiFoodResult");
+  const tot = aiFoodItems.reduce((a, it) => { const t = aiItemTotals(it); a.cal += t.cal; a.p += t.p; a.f += t.f; a.c += t.c; return a; }, { cal: 0, p: 0, f: 0, c: 0 });
+  box.innerHTML = aiFoodItems.map((it, i) => { const t = aiItemTotals(it); return `
+    <div class="result-item" style="cursor:default;flex-wrap:wrap;gap:6px">
+      <div class="ri-main" style="min-width:60%"><div class="ri-name">${esc(it.name)}</div><div class="ri-sub" id="aiSub${i}">${t.cal} ккал · Б ${fmtNum(t.p)} · Ж ${fmtNum(t.f)} · У ${fmtNum(t.c)}</div></div>
+      <input type="number" class="ai-grams" data-i="${i}" value="${it.grams}" min="1" inputmode="numeric" style="width:84px"> г
+      <button class="small ghost" data-action="aiFoodDel" data-i="${i}" title="Убрать">✕</button>
+    </div>`; }).join("") + `
+    <div class="hint" id="aiTotal" style="margin:8px 0">Итого: ${tot.cal} ккал · Б ${fmtNum(tot.p)} · Ж ${fmtNum(tot.f)} · У ${fmtNum(tot.c)}</div>
+    <div class="btn-row"><button data-action="aiFoodAdd">Добавить в дневник (${aiFoodItems.length})</button></div>`;
+  box.querySelectorAll(".ai-grams").forEach(inp => inp.addEventListener("input", () => {
+    const i = +inp.dataset.i; aiFoodItems[i].grams = Math.max(1, Math.round(num(inp.value) || 1));
+    const t = aiItemTotals(aiFoodItems[i]);
+    $("#aiSub" + i).textContent = `${t.cal} ккал · Б ${fmtNum(t.p)} · Ж ${fmtNum(t.f)} · У ${fmtNum(t.c)}`;
+    const all = aiFoodItems.reduce((a, it) => { const x = aiItemTotals(it); a.cal += x.cal; a.p += x.p; a.f += x.f; a.c += x.c; return a; }, { cal: 0, p: 0, f: 0, c: 0 });
+    $("#aiTotal").textContent = `Итого: ${all.cal} ккал · Б ${fmtNum(all.p)} · Ж ${fmtNum(all.f)} · У ${fmtNum(all.c)}`;
+  }));
+}
+function aiFoodAdd() {
+  const meal = $("#aiMeal").value;
+  aiFoodItems.forEach(it => { const t = aiItemTotals(it); data.foods.push(touch({ id: uid(), date: selectedDate, meal, name: it.name, grams: it.grams, cal: t.cal, p: t.p, f: t.f, c: t.c })); });
+  const n = aiFoodItems.length; aiFoodItems = []; aiPhotoData = null;
+  closeModal(); refresh();
+  toast(`Добавлено из ИИ: ${n} ${plural(n, "позиция", "позиции", "позиций")}`);
+}
+
+/* ---------- ИИ-тренер: разбор недели ---------- */
+function aiContextText() {
+  const s = data.settings, today = todayStr(), L = [];
+  const dm = d => d.slice(8, 10) + "." + d.slice(5, 7);
+  L.push(`Сегодня ${today}. Профиль: пол ${s.sex || "?"}, рост ${s.height || "?"} см, возраст ${s.age || "?"}, режим: ${s.mode || "не указан"}.`);
+  L.push(`Цели: ${s.goalCal || "?"} ккал, Б ${s.goalP || "?"} / Ж ${s.goalF || "?"} / У ${s.goalC || "?"} г, целевой вес ${s.goalWeight || "?"} кг.`);
+  const ws = sortedWeights().filter(w => w.date >= shiftDate(today, -45));
+  if (ws.length) {
+    const step = Math.max(1, Math.floor(ws.length / 12));
+    L.push("Вес (кг): " + ws.filter((w, i) => i % step === 0 || i === ws.length - 1).map(w => `${dm(w.date)} ${w.kg}`).join(", ") + ".");
+  }
+  const food = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = shiftDate(today, -i), fs = foodsFor(d);
+    if (!fs.length) continue;
+    const t = fs.reduce((a, f) => ({ cal: a.cal + num(f.cal), p: a.p + num(f.p), f: a.f + num(f.f), c: a.c + num(f.c) }), { cal: 0, p: 0, f: 0, c: 0 });
+    food.push(`${dm(d)}: ${Math.round(t.cal)} ккал, Б${Math.round(t.p)} Ж${Math.round(t.f)} У${Math.round(t.c)}`);
+  }
+  L.push("Питание за 14 дней (дни без записей пропущены): " + (food.length ? food.join("; ") : "записей нет") + ".");
+  const from = shiftDate(today, -14);
+  const wk = data.workouts.filter(w => w.date >= from && Array.isArray(w.exercises)).sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-8).map(w =>
+    `${dm(w.date)} ${w.name || "тренировка"}: ` + w.exercises.slice(0, 8).map(e => `${e.name} ${(e.sets || []).slice(0, 4).map(x => `${x.weight || 0}×${x.reps || 0}`).join(",")}`).join("; "));
+  L.push("Тренировки за 14 дней: " + (wk.length ? wk.join(" | ") : "нет записей") + ".");
+  return L.join("\n").slice(0, 6000);
+}
+const AI_COACH_PROMPT = "Ты дружелюбный персональный тренер и диетолог. Отвечай по-русски, коротко и по делу (до 250 слов), опираясь на данные пользователя. Дай 3–5 конкретных наблюдений и советов. Если данных мало — скажи об этом. Не ставь медицинских диагнозов; при тревожных симптомах советуй обратиться к врачу.";
+function openAiCoach() {
+  if (!aiConfigured()) { toast("Сначала настройте ИИ: Ещё → ИИ-помощник", true); return; }
+  aiCoachHistory = [];
+  openModal(`
+    <div class="modal-head"><h3>ИИ-тренер ✨</h3><button class="close-x" data-action="closeModal">✕</button></div>
+    <label class="field">Вопрос<textarea id="aiQ" style="min-height:70px">Сделай разбор моей недели: питание, тренировки и вес. Что улучшить?</textarea></label>
+    <div class="btn-row"><button data-action="aiCoachAsk">Спросить</button></div>
+    <div id="aiAnswers"></div>
+    <div class="hint">ИИ видит ваш вес, питание и тренировки за последние недели (отправляются выбранному сервису). Это не медицинская рекомендация.</div>`);
+}
+async function aiCoachAsk() {
+  const q = ($("#aiQ").value || "").trim();
+  if (!q) return;
+  const box = $("#aiAnswers");
+  box.insertAdjacentHTML("beforeend", `<div class="hint" id="aiWait" style="margin:8px 0">Думаю…</div>`);
+  try {
+    const msgs = [{ role: "system", content: AI_COACH_PROMPT }, { role: "user", content: "Мои данные:\n" + aiContextText() }, { role: "assistant", content: "Данные получил. Задавайте вопрос." }, ...aiCoachHistory, { role: "user", content: q }];
+    const ans = await aiChat(msgs);
+    aiCoachHistory.push({ role: "user", content: q }, { role: "assistant", content: ans });
+    const w = $("#aiWait"); if (w) w.remove();
+    box.insertAdjacentHTML("beforeend", `<div class="panel" style="margin:8px 0"><div class="hint" style="margin:0 0 6px"><b>Вы:</b> ${esc(q)}</div><div>${aiMdLite(ans)}</div></div>`);
+    $("#aiQ").value = "";
+    box.lastElementChild.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  } catch (e) {
+    const w = $("#aiWait"); if (w) w.remove();
+    box.insertAdjacentHTML("beforeend", `<div class="empty">Не получилось: ${esc(String((e && e.message) || e))}</div>`);
+  }
+}
+
 // Каждый блок «Прогресса» рисуется отдельно: сбой в одном не должен оставлять пустыми остальные
 let progErrShown = false;
 function safeRun(label, fn, el) {
@@ -2251,6 +2481,7 @@ function safeRun(label, fn, el) {
 
 function renderProgress() {
   progErrShown = false;
+  ensureAiUi();
   const weights = sortedWeights();
   const s = data.settings;
 
@@ -2915,6 +3146,8 @@ function renderSettings() {
   // синхронизация
   renderSyncSection();
   renderInstallGuide();
+  ensureAiUi();
+  renderAiSection();
 }
 
 function renderSyncSection() {
@@ -3114,7 +3347,7 @@ function mergeCloud(cloud) {
   }
   if (cloud.settings) {
     const cs = { ...cloud.settings };
-    delete cs.openaiKey; delete cs.geminiKey; delete cs.firebaseConfig; // секреты не синхронизируем
+    delete cs.openaiKey; delete cs.geminiKey; delete cs.aiKey; delete cs.firebaseConfig; // секреты не синхронизируем
     for (const k of Object.keys(cs)) {
       const lv = data.settings[k], cv = cs[k];
       const isUndef = lv === undefined || lv === null || lv === "" || (Array.isArray(lv) && !lv.length);
@@ -3131,7 +3364,7 @@ async function syncPush(silent) {
   try {
     const { doc, setDoc } = fbModules.dbMod;
     const payload = JSON.parse(JSON.stringify(data));
-    payload.settings = { ...payload.settings, geminiKey: "", openaiKey: "", firebaseConfig: "" }; // секреты не покидают устройство
+    payload.settings = { ...payload.settings, geminiKey: "", openaiKey: "", aiKey: "", firebaseConfig: "" }; // секреты не покидают устройство
     await setDoc(doc(fbDb, "users", fbUser.uid), { data: JSON.stringify(payload), syncedAt: Date.now() });
     syncState = { ok: true, err: false, msg: "Синхронизировано " + new Date().toLocaleTimeString("ru-RU") };
     renderSyncSection();
@@ -3179,6 +3412,27 @@ const actions = {
   addFood: (el) => { openFoodSearch(el.dataset.meal || "Обед", el.dataset.target === "plan" ? "plan" : "diary"); },
   manualEntry: () => showAddManually(),
   photoFood: () => { openFoodSearch(null, "diary", "photo"); },
+  aiSave: () => {
+    const st = data.settings;
+    st.aiBase = ($("#aiBase").value || "").trim();
+    st.aiModel = ($("#aiModel").value || "").trim();
+    st.aiVision = $("#aiVision").checked;
+    const k = ($("#aiKey").value || "").trim(); if (k) st.aiKey = k;
+    persist(); toast("Настройки ИИ сохранены"); renderAiSection();
+  },
+  aiTest: async () => {
+    actions.aiSave();
+    const el = $("#aiStatus"); if (el) el.textContent = "Проверяю связь…";
+    try { const a = await aiChat([{ role: "user", content: "Ответь одним словом: ок" }]); if ($("#aiStatus")) $("#aiStatus").textContent = "✓ Связь есть. Ответ модели: " + a.slice(0, 60); }
+    catch (e) { if ($("#aiStatus")) $("#aiStatus").textContent = "✗ " + String((e && e.message) || e); }
+  },
+  aiGoSettings: () => { closeModal(); const b = $("button[data-tab=settings]"); if (b) b.click(); },
+  aiPickPhoto: () => { const i = $("#aiPhotoInput"); if (i) i.click(); },
+  aiFoodRun: () => aiFoodRun(),
+  aiFoodDel: (el) => { aiFoodItems.splice(+el.dataset.i, 1); if (aiFoodItems.length) renderAiFoodItems(); else $("#aiFoodResult").innerHTML = ""; },
+  aiFoodAdd: () => aiFoodAdd(),
+  aiCoach: () => openAiCoach(),
+  aiCoachAsk: () => aiCoachAsk(),
   voiceFood: () => openVoice(),
   barcodeFood: () => { openFoodSearch(null, "diary", "barcode"); },
   closeModal: () => closeModal(),
@@ -3498,7 +3752,7 @@ const actions = {
   },
   exportData: () => {
     const payload = JSON.parse(JSON.stringify(data));
-    payload.settings = { ...payload.settings, geminiKey: "", openaiKey: "", firebaseConfig: "" }; // ключи в экспорт не включаем
+    payload.settings = { ...payload.settings, geminiKey: "", openaiKey: "", aiKey: "", firebaseConfig: "" }; // ключи в экспорт не включаем
     saveFile(`dnevnik-zdorovia-${todayStr()}.json`, JSON.stringify(payload, null, 2), "application/json");
     toast("Файл с данными готов");
   },
@@ -3543,7 +3797,7 @@ const actions = {
           mergeCloud(imported);
           if (imported.settings && typeof imported.settings === "object") {
             const cs = { ...imported.settings };
-            delete cs.openaiKey; delete cs.geminiKey; delete cs.firebaseConfig; // ключи не переносим
+            delete cs.openaiKey; delete cs.geminiKey; delete cs.aiKey; delete cs.firebaseConfig; // ключи не переносим
             Object.assign(data.settings, cs);
           }
           persist(); renderAll();
