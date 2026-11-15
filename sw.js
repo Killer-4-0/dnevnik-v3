@@ -1,4 +1,4 @@
-const CACHE_NAME = "dnevnik-zdorovia-v29";
+const CACHE_NAME = "dnevnik-zdorovia-v30";
 const ASSETS = [
   "./",
   "index.html",

@@ -371,6 +371,7 @@ function defaultData() {
     foods: [], weights: [], workouts: [],
     customFoods: [],
     plans: [],
+    chats: [],           // ИИ-чаты: {id, title, model, ctx, instr, messages:[{role, content, t}], created, u}
     mealPlan: {},        // дата -> [{id, meal, name, grams, cal, p, f, c}]
     settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     updatedAt: 0
@@ -2253,14 +2254,14 @@ async function aiHttpPost(url, headers, bodyObj) {
   return { status: r.status, json, text };
 }
 
-async function aiChat(messages) {
+async function aiChat(messages, opts) {
   const s = data.settings;
   if (!aiConfigured()) throw new Error("ИИ не настроен: укажите адрес API, ключ и модель (Ещё → ИИ-помощник)");
   let base = String(s.aiBase).trim().replace(/\/+$/, "");
   const url = /\/chat\/completions$/.test(base) ? base : base + "/chat/completions";
   let r;
   try {
-    r = await aiHttpPost(url, { "Content-Type": "application/json", "Authorization": "Bearer " + String(s.aiKey).trim() }, { model: s.aiModel, messages });
+    r = await aiHttpPost(url, { "Content-Type": "application/json", "Authorization": "Bearer " + String(s.aiKey).trim() }, { model: (opts && opts.model) || s.aiModel, messages });
   } catch (e) {
     throw new Error("не удалось связаться с сервером ИИ (" + String((e && e.message) || e) + "). Проверьте интернет и адрес API");
   }
@@ -2287,7 +2288,7 @@ function aiMdLite(text) { // безопасное мини-форматиров�
   return esc(text).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/^#{1,4}\s*(.+)$/gm, "<b>$1</b>").replace(/\n/g, "<br>");
 }
 
-/* ---------- интерфейс: настройки и кнопка в «Прогрессе» (создаются кодом, чтобы не зависеть от index.html) ---------- */
+/* ---------- интерфейс: настройки и панель чата в «Прогрессе» (создаются кодом, чтобы не зависеть от index.html) ---------- */
 function ensureAiUi() {
   if (!$("#aiSection")) {
     const anchor = $("[data-action=exportData]");
@@ -2296,8 +2297,9 @@ function ensureAiUi() {
   }
   if (!$("#aiCoachPanel")) {
     const po = $("#progOverview");
-    if (po) po.insertAdjacentHTML("afterbegin", `<div class="panel" id="aiCoachPanel"><div class="section-title">ИИ-тренер ✨</div><div class="hint" style="margin:0 0 8px">Разбор недели по вашим данным: питание, тренировки, вес.</div><div class="btn-row" style="margin-top:0"><button data-action="aiCoach">✨ Разбор моей недели</button></div></div>`);
+    if (po) po.insertAdjacentHTML("afterbegin", `<div class="panel" id="aiCoachPanel"></div>`);
   }
+  renderAiChatPanel();
 }
 function renderAiSection() {
   const el = $("#aiSection");
@@ -2305,14 +2307,17 @@ function renderAiSection() {
   const s = data.settings;
   el.innerHTML = `<div class="panel">
     <div class="section-title">ИИ-помощник ✨</div>
-    <div class="hint" style="margin:0 0 8px">Распознавание еды по фото и тексту, разбор недели. Подойдёт любой сервис с OpenAI-совместимым API. Ключ хранится только на этом устройстве и не попадает в экспорт.</div>
-    <label class="field">Адрес API (base URL)<input id="aiBase" placeholder="например: https://api.example.com/v1" value="${esc(s.aiBase || "")}" autocomplete="off" autocapitalize="off"></label>
+    <div class="hint" style="margin:0 0 8px">Чат, распознавание еды по тексту и фото. Подойдёт любой сервис с OpenAI-совместимым API. Ключ хранится только на этом устройстве и не попадает в экспорт.</div>
+    <label class="field">Адрес API (base URL)<input id="aiBase" placeholder="https://api.munito.ai/inference/v1" value="${esc(s.aiBase || "")}" autocomplete="off" autocapitalize="off"></label>
     <label class="field">Ключ API<input id="aiKey" type="password" placeholder="${s.aiKey ? "сохранён (оставьте пустым, чтобы не менять)" : "вставьте ключ"}" autocomplete="off"></label>
-    <label class="field">Модель<input id="aiModel" placeholder="название модели из кабинета сервиса" value="${esc(s.aiModel || "")}" autocomplete="off" autocapitalize="off"></label>
-    <label class="field" style="display:flex;gap:8px;align-items:center;flex-direction:row"><input type="checkbox" id="aiVision" style="width:18px;min-height:0" ${s.aiVision ? "checked" : ""}> Модель умеет читать фото</label>
+    <label class="field">Модель<select id="aiModel">${aiModelOptions(s.aiModel)}</select></label>
+    <label class="field">Модель для фото (если отличается)<select id="aiVisionModel">${aiModelOptions(s.aiVisionModel || "", "— та же модель —")}</select></label>
+    <label class="field" style="display:flex;gap:8px;align-items:center;flex-direction:row"><input type="checkbox" id="aiVision" style="width:18px;min-height:0" ${s.aiVision ? "checked" : ""}> Основная модель умеет читать фото</label>
     <div class="btn-row"><button data-action="aiSave">Сохранить</button><button class="ghost" data-action="aiTest">Проверить связь</button></div>
+    <div class="btn-row"><button class="ghost" data-action="aiFetchModels">🔄 Загрузить список моделей с сервера</button></div>
     <div class="hint" id="aiStatus" style="margin-top:6px"></div>
   </div>`;
+  aiBindModelSelect($("#aiModel")); aiBindModelSelect($("#aiVisionModel"));
 }
 
 /* ---------- вкладка «✨ ИИ» в добавлении еды ---------- */
@@ -2364,14 +2369,14 @@ cal — ккал, p/f/c — граммы белков/жиров/углевод�
 async function aiFoodRun() {
   const text = ($("#aiFoodText").value || "").trim();
   if (!aiPhotoData && !text) { toast("Добавьте фото или описание", true); return; }
-  if (aiPhotoData && !data.settings.aiVision) { toast("Включите «Модель умеет читать фото» в настройках ИИ или опишите еду словами", true); return; }
+  if (aiPhotoData && !(data.settings.aiVision || data.settings.aiVisionModel)) { toast("Включите «Модель умеет читать фото» в настройках ИИ или опишите еду словами", true); return; }
   const box = $("#aiFoodResult");
   box.innerHTML = `<div class="hint">Думаю… это может занять до минуты</div>`;
   try {
     const content = aiPhotoData
       ? [{ type: "text", text: text ? "Описание от пользователя: " + text : "Определи еду на фото." }, { type: "image_url", image_url: { url: aiPhotoData } }]
       : text;
-    const out = await aiChat([{ role: "system", content: AI_FOOD_PROMPT }, { role: "user", content }]);
+    const out = await aiChat([{ role: "system", content: AI_FOOD_PROMPT }, { role: "user", content }], aiPhotoData && data.settings.aiVisionModel ? { model: data.settings.aiVisionModel } : undefined);
     const j = aiParseJson(out);
     const arr = Array.isArray(j) ? j : j.items;
     aiFoodItems = (arr || []).map(it => {
@@ -2438,34 +2443,151 @@ function aiContextText() {
   L.push("Тренировки за 14 дней: " + (wk.length ? wk.join(" | ") : "нет записей") + ".");
   return L.join("\n").slice(0, 6000);
 }
-const AI_COACH_PROMPT = "Ты дружелюбный персональный тренер и диетолог. Отвечай по-русски, коротко и по делу (до 250 слов), опираясь на данные пользователя. Дай 3–5 конкретных наблюдений и советов. Если данных мало — скажи об этом. Не ставь медицинских диагнозов; при тревожных симптомах советуй обратиться к врачу.";
-function openAiCoach() {
-  if (!aiConfigured()) { toast("Сначала настройте ИИ: Ещё → ИИ-помощник", true); return; }
-  aiCoachHistory = [];
-  openModal(`
-    <div class="modal-head"><h3>ИИ-тренер ✨</h3><button class="close-x" data-action="closeModal">✕</button></div>
-    <label class="field">Вопрос<textarea id="aiQ" style="min-height:70px">Сделай разбор моей недели: питание, тренировки и вес. Что улучшить?</textarea></label>
-    <div class="btn-row"><button data-action="aiCoachAsk">Спросить</button></div>
-    <div id="aiAnswers"></div>
-    <div class="hint">ИИ видит ваш вес, питание и тренировки за последние недели (отправляются выбранному сервису). Это не медицинская рекомендация.</div>`);
+/* ---------- ИИ-чат: свободный диалог с историей (чаты хранятся в data.chats и переносятся вместе с данными) ---------- */
+const AI_MODELS = ["deepseek-v4-flash", "deepseek-v4.1-flash-1017", "glm-5.3-flash", "qwen3.8-27b", "kolibri-1", "gemma-4-12b", "lightonocr-3-4b"];
+const AI_MODEL_NOTES = { "lightonocr-3-4b": "распознавание текста с картинок, для чата не подходит" };
+let aiCurChat = null, aiChatBusy = false;
+
+function aiModelOptions(selected, emptyLabel) {
+  const extra = (data.settings.aiModels || []).filter(m => !AI_MODELS.includes(m));
+  const own = selected && !AI_MODELS.includes(selected) && !extra.includes(selected) ? [selected] : [];
+  const opt = m => `<option value="${esc(m)}"${m === selected ? " selected" : ""}>${esc(m)}${AI_MODEL_NOTES[m] ? " — " + esc(AI_MODEL_NOTES[m]) : ""}</option>`;
+  return (emptyLabel ? `<option value=""${!selected ? " selected" : ""}>${esc(emptyLabel)}</option>` : "")
+    + `<optgroup label="Munito AI">${AI_MODELS.map(opt).join("")}</optgroup>`
+    + (extra.length ? `<optgroup label="С сервера">${extra.map(opt).join("")}</optgroup>` : "")
+    + (own.length ? `<optgroup label="Своя">${own.map(opt).join("")}</optgroup>` : "")
+    + `<option value="__custom__">✎ Другая модель…</option>`;
 }
-async function aiCoachAsk() {
-  const q = ($("#aiQ").value || "").trim();
-  if (!q) return;
-  const box = $("#aiAnswers");
-  box.insertAdjacentHTML("beforeend", `<div class="hint" id="aiWait" style="margin:8px 0">Думаю…</div>`);
+function aiBindModelSelect(sel, onPick) { // пункт «Другая модель…» спрашивает ID
+  if (!sel) return;
+  let prev = sel.value;
+  sel.addEventListener("change", () => {
+    if (sel.value === "__custom__") {
+      const v = (prompt("Введите ID модели (как в кабинете сервиса):", "") || "").trim();
+      if (v) { sel.insertAdjacentHTML("afterbegin", `<option value="${esc(v)}">${esc(v)}</option>`); sel.value = v; } else sel.value = prev;
+    }
+    prev = sel.value;
+    if (onPick) onPick(sel.value);
+  });
+}
+async function aiHttpGet(url, headers) {
+  const cap = window.Capacitor, http = cap && cap.Plugins && cap.Plugins.CapacitorHttp;
+  if (cap && typeof cap.isNativePlatform === "function" && cap.isNativePlatform() && http) {
+    const r = await http.request({ url, method: "GET", headers, connectTimeout: 20000, readTimeout: 30000 });
+    return { status: r.status, json: typeof r.data === "string" ? (() => { try { return JSON.parse(r.data); } catch { return null; } })() : r.data };
+  }
+  const r = await fetch(url, { headers });
+  let json = null; try { json = await r.json(); } catch { /* не JSON */ }
+  return { status: r.status, json };
+}
+async function aiFetchModels() {
+  const s = data.settings;
+  if (!s.aiBase || !s.aiKey) throw new Error("сначала укажите адрес и ключ и нажмите «Сохранить»");
+  const url = String(s.aiBase).trim().replace(/\/+$/, "").replace(/\/chat\/completions$/, "") + "/models";
+  const r = await aiHttpGet(url, { "Authorization": "Bearer " + String(s.aiKey).trim() });
+  if (r.status < 200 || r.status >= 300) throw new Error("сервер ответил " + r.status + " (список моделей недоступен — выберите модель из готового списка)");
+  const j = r.json, arr = Array.isArray(j) ? j : (j && (j.data || j.models)) || [];
+  const ids = [...new Set(arr.map(x => typeof x === "string" ? x : (x && (x.id || x.name))).filter(Boolean))];
+  if (!ids.length) throw new Error("сервер не вернул список моделей");
+  s.aiModels = ids; persist();
+  return ids;
+}
+
+function aiChats() { return (data.chats = data.chats || []); }
+function aiChatById(id) { return aiChats().find(c => c.id === id); }
+function aiShortDate(ts) { const d = new Date(ts); return String(d.getDate()).padStart(2, "0") + "." + String(d.getMonth() + 1).padStart(2, "0"); }
+function renderAiChatPanel() {
+  const el = $("#aiCoachPanel");
+  if (!el) return;
+  const n = aiChats().length;
+  el.innerHTML = `<div class="section-title">ИИ-чат 💬</div>
+    <div class="hint" style="margin:0 0 8px">Обычный чат с ИИ: спрашивайте о чём угодно. Чаты сохраняются и переносятся вместе с данными. По желанию можно показать ИИ ваш вес, питание и тренировки.</div>
+    <div class="btn-row" style="margin-top:0"><button data-action="aiChatNew">＋ Новый чат</button>${n ? `<button class="ghost" data-action="aiChatList">Все чаты (${n})</button>` : ""}</div>`;
+}
+function aiBuildMessages(chat) {
+  const sys = [];
+  if ((chat.instr || "").trim()) sys.push(chat.instr.trim());
+  if ((data.settings.aiMemory || "").trim()) sys.push("Что важно помнить о пользователе:\n" + data.settings.aiMemory.trim());
+  if (chat.ctx) sys.push("Данные пользователя из его дневника здоровья (используй, если это уместно для вопроса):\n" + aiContextText());
+  const msgs = sys.length ? [{ role: "system", content: sys.join("\n\n") }] : [];
+  return msgs.concat(chat.messages.filter(m => m.role === "user" || m.role === "assistant").slice(-30).map(m => ({ role: m.role, content: m.content })));
+}
+function aiBubbleHtml(m, i) {
+  return m.role === "user"
+    ? `<div class="ai-msg user">${esc(m.content).replace(/\n/g, "<br>")}</div>`
+    : `<div class="ai-msg bot">${aiMdLite(m.content)}<div class="ai-msg-tools"><button class="small ghost" data-action="aiMsgCopy" data-i="${i}">Копировать</button></div></div>`;
+}
+function openAiChatList() {
+  if (!aiConfigured()) { toast("Сначала настройте ИИ: Ещё → ИИ-помощник", true); return; }
+  aiCurChat = null;
+  const list = [...aiChats()].sort((a, b) => (b.u || 0) - (a.u || 0));
+  openModal(`
+    <div class="modal-head"><h3>ИИ-чат 💬</h3><button class="close-x" data-action="closeModal">✕</button></div>
+    <div class="btn-row" style="margin-top:0"><button data-action="aiChatNew">＋ Новый чат</button></div>
+    ${list.length ? list.map(c => { const last = c.messages[c.messages.length - 1]; return `
+      <div class="ai-chat-item"><div class="main" data-action="aiChatOpen" data-id="${c.id}"><div class="t">${esc(c.title || "Новый чат")}</div><div class="s">${aiShortDate(c.u || c.created)} · ${esc(last ? String(last.content).replace(/\s+/g, " ").slice(0, 70) : "пусто")}</div></div><button class="icon-btn" data-action="aiChatDel" data-id="${c.id}" title="Удалить чат">✕</button></div>`; }).join("") : `<div class="empty">Чатов пока нет. Нажмите «Новый чат».</div>`}`);
+}
+function openAiChat(id) {
+  const chat = aiChatById(id);
+  if (!chat) { openAiChatList(); return; }
+  aiCurChat = id;
+  const s = data.settings;
+  openModal(`
+    <div class="modal-head"><button class="small ghost" data-action="aiChatList">←</button><h3 id="aiChatTitle" style="flex:1;margin:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(chat.title || "Новый чат")}</h3><button class="close-x" data-action="closeModal">✕</button></div>
+    <details class="ai-settings"><summary>⚙ Настройки чата</summary>
+      <label class="field">Модель<select id="aiChatModel">${aiModelOptions(chat.model || s.aiModel)}</select></label>
+      <label class="field" style="display:flex;gap:8px;align-items:center;flex-direction:row"><input type="checkbox" id="aiChatCtx" style="width:18px;min-height:0" ${chat.ctx ? "checked" : ""}> Показывать ИИ мои данные (вес, питание, тренировки)</label>
+      <label class="field">Память — ИИ учитывает это во всех чатах<textarea id="aiMemory" placeholder="например: мне 30 лет, цель — набрать мышцы, не ем рыбу" style="min-height:70px">${esc(s.aiMemory || "")}</textarea></label>
+      <label class="field">Инструкция для этого чата (необязательно)<textarea id="aiChatInstr" placeholder="например: отвечай кратко" style="min-height:56px">${esc(chat.instr || "")}</textarea></label>
+      <div class="btn-row"><button class="small ghost" data-action="aiChatRename">Переименовать</button><button class="small danger" data-action="aiChatDelete">Удалить чат</button></div>
+    </details>
+    <div class="ai-chat-msgs" id="aiMsgs">${chat.messages.length ? chat.messages.map(aiBubbleHtml).join("") : `<div class="hint" style="margin:8px 0">Напишите сообщение. ИИ помнит всю переписку в этом чате.</div>`}</div>
+    <div class="ai-chips"><button class="small ghost" data-action="aiChatChip" data-q="Сделай разбор моей недели: питание, тренировки и вес. Что улучшить?">📊 Разбор моей недели</button></div>
+    <div class="ai-input-row"><textarea id="aiChatInput" placeholder="Сообщение…" rows="1"></textarea><button data-action="aiChatSend" title="Отправить">➤</button></div>`);
+  aiBindModelSelect($("#aiChatModel"), v => { chat.model = v; touch(chat); persist(); });
+  $("#aiChatCtx").addEventListener("change", e => { chat.ctx = e.target.checked; touch(chat); persist(); });
+  $("#aiMemory").addEventListener("change", e => { data.settings.aiMemory = e.target.value; persist(); toast("Память сохранена"); });
+  $("#aiChatInstr").addEventListener("change", e => { chat.instr = e.target.value; touch(chat); persist(); });
+  const m = $("#aiMsgs"); if (m) m.scrollTop = m.scrollHeight;
+}
+function aiChatNew() {
+  if (!aiConfigured()) { toast("Сначала настройте ИИ: Ещё → ИИ-помощник", true); return; }
+  const chat = touch({ id: uid(), title: "Новый чат", model: data.settings.aiModel, ctx: false, instr: "", messages: [], created: Date.now() });
+  aiChats().push(chat); persist();
+  renderAiChatPanel();
+  openAiChat(chat.id);
+}
+async function aiChatRespond(chat) {
+  if (aiChatBusy) return;
+  aiChatBusy = true;
+  const box = () => $("#aiMsgs");
+  const scroll = () => { const m = box(); if (m) m.scrollTop = m.scrollHeight; };
+  if (box()) { box().insertAdjacentHTML("beforeend", `<div class="ai-msg bot" id="aiWait" style="opacity:.7">Думаю…</div>`); scroll(); }
   try {
-    const msgs = [{ role: "system", content: AI_COACH_PROMPT }, { role: "user", content: "Мои данные:\n" + aiContextText() }, { role: "assistant", content: "Данные получил. Задавайте вопрос." }, ...aiCoachHistory, { role: "user", content: q }];
-    const ans = await aiChat(msgs);
-    aiCoachHistory.push({ role: "user", content: q }, { role: "assistant", content: ans });
+    const model = chat.model || data.settings.aiModel;
+    const ans = await aiChat(aiBuildMessages(chat), { model });
+    chat.messages.push({ role: "assistant", content: ans, t: Date.now(), model });
+    touch(chat); persist();
     const w = $("#aiWait"); if (w) w.remove();
-    box.insertAdjacentHTML("beforeend", `<div class="panel" style="margin:8px 0"><div class="hint" style="margin:0 0 6px"><b>Вы:</b> ${esc(q)}</div><div>${aiMdLite(ans)}</div></div>`);
-    $("#aiQ").value = "";
-    box.lastElementChild.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    if (aiCurChat === chat.id && box()) { box().insertAdjacentHTML("beforeend", aiBubbleHtml(chat.messages[chat.messages.length - 1], chat.messages.length - 1)); scroll(); }
   } catch (e) {
     const w = $("#aiWait"); if (w) w.remove();
-    box.insertAdjacentHTML("beforeend", `<div class="empty">Не получилось: ${esc(String((e && e.message) || e))}</div>`);
-  }
+    if (aiCurChat === chat.id && box()) { box().insertAdjacentHTML("beforeend", `<div class="ai-msg bot" id="aiErr" style="border-color:#ff6b7a">Не получилось: ${esc(String((e && e.message) || e))}<div class="ai-msg-tools"><button class="small ghost" data-action="aiChatRetry">↻ Повторить</button></div></div>`); scroll(); }
+  } finally { aiChatBusy = false; renderAiChatPanel(); }
+}
+function aiChatSend(textOverride) {
+  const chat = aiChatById(aiCurChat);
+  if (!chat || aiChatBusy) return;
+  const inp = $("#aiChatInput");
+  const text = String(textOverride != null ? textOverride : (inp && inp.value) || "").trim();
+  if (!text) return;
+  if (inp) inp.value = "";
+  chat.messages.push({ role: "user", content: text, t: Date.now() });
+  if (chat.messages.length === 1 && (!chat.title || chat.title === "Новый чат")) { chat.title = text.replace(/\s+/g, " ").slice(0, 40); const t = $("#aiChatTitle"); if (t) t.textContent = chat.title; }
+  touch(chat); persist();
+  const box = $("#aiMsgs");
+  if (box) { const hint = box.querySelector(".hint"); if (hint) hint.remove(); box.insertAdjacentHTML("beforeend", aiBubbleHtml(chat.messages[chat.messages.length - 1], chat.messages.length - 1)); }
+  aiChatRespond(chat);
 }
 
 // Каждый блок «Прогресса» рисуется отдельно: сбой в одном не должен оставлять пустыми остальные
@@ -3341,6 +3463,7 @@ function mergeCloud(cloud) {
   data.workouts = mergeArr(data.workouts, cloud.workouts || []);
   data.customFoods = mergeArr(data.customFoods, cloud.customFoods || []);
   data.plans = mergeArr(data.plans, cloud.plans || []);
+  data.chats = mergeArr(data.chats || [], cloud.chats || []);
   data.mealPlan = data.mealPlan || {};
   for (const [d, items] of Object.entries(cloud.mealPlan || {})) {
     data.mealPlan[d] = mergeArr(data.mealPlan[d] || [], items);
@@ -3415,7 +3538,8 @@ const actions = {
   aiSave: () => {
     const st = data.settings;
     st.aiBase = ($("#aiBase").value || "").trim();
-    st.aiModel = ($("#aiModel").value || "").trim();
+    const mv = $("#aiModel").value; if (mv && mv !== "__custom__") st.aiModel = mv;
+    const vv = $("#aiVisionModel").value; st.aiVisionModel = vv === "__custom__" ? (st.aiVisionModel || "") : vv;
     st.aiVision = $("#aiVision").checked;
     const k = ($("#aiKey").value || "").trim(); if (k) st.aiKey = k;
     persist(); toast("Настройки ИИ сохранены"); renderAiSection();
@@ -3431,8 +3555,39 @@ const actions = {
   aiFoodRun: () => aiFoodRun(),
   aiFoodDel: (el) => { aiFoodItems.splice(+el.dataset.i, 1); if (aiFoodItems.length) renderAiFoodItems(); else $("#aiFoodResult").innerHTML = ""; },
   aiFoodAdd: () => aiFoodAdd(),
-  aiCoach: () => openAiCoach(),
-  aiCoachAsk: () => aiCoachAsk(),
+  aiFetchModels: async () => {
+    const el = $("#aiStatus"); if (el) el.textContent = "Загружаю список моделей…";
+    try {
+      actions.aiSave();
+      const ids = await aiFetchModels();
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      renderAiSection();
+      const st = $("#aiStatus"); if (st) st.textContent = `✓ Загружено моделей: ${ids.length}. Они в выпадающем списке в группе «С сервера».`;
+    } catch (e) { const st = $("#aiStatus"); if (st) st.textContent = "✗ " + String((e && e.message) || e); }
+  },
+  aiChatNew: () => aiChatNew(),
+  aiChatList: () => openAiChatList(),
+  aiChatOpen: (el) => openAiChat(el.dataset.id),
+  aiChatDel: (el) => {
+    const c = aiChatById(el.dataset.id);
+    if (c && confirm(`Удалить чат «${c.title || "Новый чат"}»?`)) { data.chats = aiChats().filter(x => x.id !== c.id); tombstone(c.id); persist(); renderAiChatPanel(); openAiChatList(); }
+  },
+  aiChatDelete: () => {
+    const c = aiChatById(aiCurChat);
+    if (c && confirm(`Удалить чат «${c.title || "Новый чат"}»?`)) { data.chats = aiChats().filter(x => x.id !== c.id); tombstone(c.id); persist(); renderAiChatPanel(); openAiChatList(); }
+  },
+  aiChatRename: () => {
+    const c = aiChatById(aiCurChat); if (!c) return;
+    const v = (prompt("Название чата:", c.title || "") || "").trim();
+    if (v) { c.title = v; touch(c); persist(); const t = $("#aiChatTitle"); if (t) t.textContent = v; renderAiChatPanel(); }
+  },
+  aiChatSend: () => aiChatSend(),
+  aiChatChip: (el) => { const c = aiChatById(aiCurChat); if (!c) return; c.ctx = true; const cb = $("#aiChatCtx"); if (cb) cb.checked = true; touch(c); persist(); aiChatSend(el.dataset.q); },
+  aiChatRetry: () => { const e = $("#aiErr"); if (e) e.remove(); const c = aiChatById(aiCurChat); if (c) aiChatRespond(c); },
+  aiMsgCopy: (el) => {
+    const c = aiChatById(aiCurChat), m = c && c.messages[+el.dataset.i];
+    if (m && navigator.clipboard) navigator.clipboard.writeText(m.content).then(() => toast("Скопировано"), () => toast("Не удалось скопировать", true));
+  },
   voiceFood: () => openVoice(),
   barcodeFood: () => { openFoodSearch(null, "diary", "barcode"); },
   closeModal: () => closeModal(),
