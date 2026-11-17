@@ -371,7 +371,6 @@ function defaultData() {
     foods: [], weights: [], workouts: [],
     customFoods: [],
     plans: [],
-    chats: [],           // ИИ-чаты: {id, title, model, ctx, instr, messages:[{role, content, t}], created, u}
     mealPlan: {},        // дата -> [{id, meal, name, grams, cal, p, f, c}]
     settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     updatedAt: 0
@@ -393,11 +392,13 @@ function migrateOld() {
     return d;
   } catch { return null; }
 }
+let legacyChats = null; // чаты из старых версий (лежали в localStorage) — переезжают в IndexedDB
 function loadData() {
   try {
     const raw = store.getItem(ACCOUNT_KEY || STORAGE_KEY);
     if (raw) {
       const d = Object.assign(defaultData(), JSON.parse(raw));
+      if (Array.isArray(d.chats)) { legacyChats = (legacyChats || []).concat(d.chats); delete d.chats; if (typeof chatsMigrate === "function") setTimeout(chatsMigrate, 0); }
       d.settings = Object.assign(JSON.parse(JSON.stringify(DEFAULT_SETTINGS)), d.settings || {});
       d.del = d.del || {};
       return d;
@@ -499,7 +500,8 @@ function restReset() {
 
 function persist() {
   data.updatedAt = Date.now();
-  try { store.setItem(ACCOUNT_KEY || STORAGE_KEY, JSON.stringify(data)); } catch (e) { toast("Не удалось сохранить данные (память браузера заполнена?)", true); }
+  try { store.setItem(ACCOUNT_KEY || STORAGE_KEY, JSON.stringify(legacyChats ? Object.assign({}, data, { chats: legacyChats }) : data)); } catch (e) { toast("Не удалось сохранить данные (память браузера заполнена?)", true); }
+  chatsSaveSoon();
   scheduleAutoSync();
 }
 // пометка записи времени изменения (для корректного слияния устройств)
@@ -2602,6 +2604,7 @@ function aiTrimImages() { // храним картинки только в 15 п
   const all = [];
   aiChats().forEach(c => c.messages.forEach(m => { if (m.img) all.push(m); }));
   all.sort((a, b) => (b.t || 0) - (a.t || 0)).slice(15).forEach(m => { delete m.img; m.imgGone = true; });
+  aiChats().forEach(c => { if (c.messages.some(m => m.imgGone)) c.u = Date.now(); }); // чтобы изменение сохранилось
 }
 
 /* ----- запись в дневник по подтверждению ----- */
@@ -2704,13 +2707,108 @@ function aiBuildMessages(chat) {
   if (chat.ctx) sys.push("Данные пользователя из его дневника здоровья (используй, если это уместно для вопроса):\n" + aiContextText());
   if (chat.diary !== false) sys.push(aiDiaryInstruction());
   const msgs = sys.length ? [{ role: "system", content: sys.join("\n\n") }] : [];
-  return msgs.concat(chat.messages.filter(m => m.role === "user" || m.role === "assistant").slice(-30).map(m => {
+  return msgs.concat(chat.messages.filter(m => m.role === "user" || m.role === "assistant").slice(-(data.settings.aiHistoryLimit || 30)).map(m => {
     let c = m.content || "";
     if (m.actions) c += "\n" + m.actions.map(a => a.status === "done" ? "(пользователь подтвердил — запись внесена в дневник)" : a.status === "cancelled" ? "(пользователь отменил запись)" : "(ждёт подтверждения)").join(" ");
     return { role: m.role, content: c };
   }));
 }
-function aiChats() { return (data.chats = data.chats || []); }
+let CHATS = [], chatsLoaded = false, chatsTimer = null;
+const chatsSaved = {}; // id -> подпись последней сохранённой версии
+const chatSig = c => c.u + ":" + (c.messages || []).length;
+function mergeById(a, b) {
+  const map = new Map();
+  (a || []).forEach(x => { if (x && x.id) map.set(x.id, x); });
+  (b || []).forEach(x => { if (x && x.id) { const o = map.get(x.id); if (!o || (x.u || 0) > (o.u || 0)) map.set(x.id, x); } });
+  return [...map.values()];
+}
+function chatsSaveSoon() { if (!chatsLoaded) return; clearTimeout(chatsTimer); chatsTimer = setTimeout(chatsSaveNow, 400); }
+async function chatsSaveNow() {
+  try {
+    const ids = new Set(CHATS.map(c => c.id));
+    for (const c of CHATS) if (chatsSaved[c.id] !== chatSig(c)) { await idbPut("chats", c); chatsSaved[c.id] = chatSig(c); }
+    for (const id of Object.keys(chatsSaved)) if (!ids.has(id)) { await idbDel("chats", id); delete chatsSaved[id]; }
+    return true;
+  } catch (e) { toast("Не удалось сохранить чаты: " + String((e && e.message) || e), true); return false; }
+}
+async function chatsMigrate() { // чаты из старого localStorage -> IndexedDB (после успешной записи убираем из localStorage)
+  if (!chatsLoaded || !legacyChats) return;
+  CHATS = mergeById(CHATS, legacyChats);
+  if (await chatsSaveNow()) { legacyChats = null; persist(); }
+}
+async function chatsInit() {
+  try {
+    const stored = await idbAll("chats");
+    stored.forEach(c => { chatsSaved[c.id] = chatSig(c); });
+    CHATS = mergeById(stored, CHATS);
+    chatsLoaded = true;
+    await chatsMigrate();
+    if (currentTab === "ai") renderAiTab();
+  } catch (e) {
+    chatsLoaded = true; // хранилище недоступно: чаты живут только в памяти до перезапуска
+    toast("Хранилище чатов недоступно на этом устройстве", true);
+  }
+}
+setTimeout(chatsInit, 0); // после полной загрузки скрипта (idb-хелперы объявлены ниже)
+function aiChats() { return CHATS; }
+
+/* ----- импорт переписок из DeepSeek / ChatGPT / Claude / обычного JSON ----- */
+function aiTs(v) { if (!v) return 0; if (typeof v === "number") return v < 1e12 ? v * 1000 : v; const t = Date.parse(v); return Number.isFinite(t) ? t : 0; }
+function aiMsgFromNode(m) { // -> [{role, content, t}]
+  const out = [], t = aiTs(m.inserted_at || m.create_time || m.created_at || m.timestamp);
+  if (Array.isArray(m.fragments)) { // DeepSeek: REQUEST / RESPONSE / THINK (рассуждения пропускаем)
+    const join = type => m.fragments.filter(f => f && f.type === type && typeof f.content === "string").map(f => f.content).join("\n").trim();
+    const q = join("REQUEST"), a = join("RESPONSE");
+    if (q) out.push({ role: "user", content: q, t });
+    if (a) out.push({ role: "assistant", content: a, t });
+    return out;
+  }
+  const role = (m.author && m.author.role) || m.role;
+  let content = "";
+  if (m.content && Array.isArray(m.content.parts)) content = m.content.parts.filter(x => typeof x === "string").join("\n"); // ChatGPT
+  else if (typeof m.content === "string") content = m.content;
+  else if (Array.isArray(m.content)) content = m.content.map(x => (typeof x === "string" ? x : (x && x.text) || "")).join("\n");
+  content = String(content || "").trim();
+  const r = /^(user|human|request)$/i.test(role) ? "user" : /^(assistant|bot|gpt|response|model)$/i.test(role) ? "assistant" : null;
+  if (r && content) out.push({ role: r, content, t });
+  return out;
+}
+function aiConvToChat(conv, idx) {
+  if (!conv || typeof conv !== "object") return null;
+  let msgs = [];
+  if (conv.mapping && typeof conv.mapping === "object") { // дерево сообщений: идём по самой свежей ветке
+    const map = conv.mapping, seen = new Set();
+    let id = map.root ? "root" : Object.keys(map).find(k => !map[k].parent);
+    while (id && map[id] && !seen.has(id)) {
+      seen.add(id);
+      const n = map[id];
+      if (n.message) msgs.push(...aiMsgFromNode(n.message));
+      const ch = n.children || [];
+      id = ch.length ? ch[ch.length - 1] : null;
+    }
+  } else {
+    const arr = conv.messages || conv.chat_messages || conv.history || [];
+    arr.forEach(m => { if (m) msgs.push(...aiMsgFromNode(m.sender ? Object.assign({}, m, { role: m.sender === "human" ? "user" : "assistant", content: m.text || m.content }) : m)); });
+  }
+  msgs = msgs.filter(m => m.content);
+  if (!msgs.length) return null;
+  const created = aiTs(conv.inserted_at || conv.create_time || conv.created_at) || msgs[0].t || Date.now();
+  const last = aiTs(conv.updated_at || conv.update_time) || msgs[msgs.length - 1].t || created;
+  const hash = str => { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
+  const rawId = conv.id || conv.conversation_id || conv.uuid || hash((conv.title || "") + "|" + msgs.length + "|" + msgs[0].content.slice(0, 200)); // без своего id: по содержимому, чтобы повторный импорт не дублировал
+  return { id: "imp-" + String(rawId).replace(/[^\w-]/g, "").slice(0, 60), title: String(conv.title || conv.name || msgs[0].content.replace(/\s+/g, " ").slice(0, 40)).slice(0, 80),
+    model: data.settings.aiModel, ctx: false, diary: false, instr: "", messages: msgs.map(m => ({ role: m.role, content: m.content, t: m.t || created })), created, u: last, imported: true };
+}
+async function aiImportChatsFile(file) {
+  let json;
+  try { json = JSON.parse(await file.text()); } catch { throw new Error("файл не похож на JSON — выберите conversations.json (если у вас zip, сначала распакуйте его)"); }
+  const list = Array.isArray(json) ? json : (json.conversations || json.data || ((json.mapping || json.messages || json.chat_messages) ? [json] : []));
+  const chats = list.map((c, i) => aiConvToChat(c, i)).filter(Boolean);
+  if (!chats.length) throw new Error("в файле не нашлось переписок в знакомом формате");
+  CHATS = mergeById(CHATS, chats); // повторный импорт не создаёт дубликатов
+  persist();
+  return { n: chats.length, m: chats.reduce((a, c) => a + c.messages.length, 0) };
+}
 function aiChatById(id) { return aiChats().find(c => c.id === id); }
 function aiShortDate(ts) { const d = new Date(ts); return String(d.getDate()).padStart(2, "0") + "." + String(d.getMonth() + 1).padStart(2, "0"); }
 function aiBubbleHtml(m, i) {
@@ -2738,9 +2836,19 @@ function openAiChatList() {
   aiMount(`<div class="panel">
     <div class="ai-head"><h3 style="margin:0;flex:1">ИИ-чат 💬</h3><button class="small" data-action="aiChatNew">＋ Новый чат</button></div>
     <div class="btn-row" style="margin:0 0 8px"><button class="small ghost" data-action="aiReportNow">📅 Отчёт за прошлую неделю</button></div>
+    <div class="btn-row" style="margin:0 0 8px"><button class="small ghost" data-action="aiChatsImport">⬆ Импорт чатов (DeepSeek, ChatGPT, JSON)</button></div><input type="file" id="aiImpInput" accept=".json,application/json" hidden>
     ${list.length ? list.map(c => { const last = c.messages[c.messages.length - 1]; return `
       <div class="ai-chat-item"><div class="main" data-action="aiChatOpen" data-id="${c.id}"><div class="t">${esc(c.title || "Новый чат")}</div><div class="s">${aiShortDate(c.u || c.created)} · ${esc(last ? String(last.content || "🖼").replace(/\s+/g, " ").slice(0, 70) : "пусто")}</div></div><button class="icon-btn" data-action="aiChatDel" data-id="${c.id}" title="Удалить чат">✕</button></div>`; }).join("") : `<div class="empty">Чатов пока нет. Нажмите «Новый чат».</div>`}
-    <div class="hint" style="margin-top:10px">Чаты сохраняются и переносятся вместе с данными (экспорт, импорт, синхронизация).</div></div>`);
+    <div class="hint" style="margin-top:10px">Чаты хранятся на устройстве (в отдельном большом хранилище) и переносятся вместе с данными через экспорт и импорт. В облачную синхронизацию они не входят.</div></div>`);
+  const imp = $("#aiImpInput");
+  if (imp) imp.addEventListener("change", async e => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    toast("Читаю файл…");
+    try { const r = await aiImportChatsFile(f); toast(`Импортировано чатов: ${r.n} (сообщений: ${r.m})`); openAiChatList(); }
+    catch (err) { toast("Импорт не удался: " + String((err && err.message) || err), true); }
+    e.target.value = "";
+  });
 }
 function openAiChat(id) {
   const chat = aiChatById(id);
@@ -2755,6 +2863,8 @@ function openAiChat(id) {
       <label class="field" style="display:flex;gap:8px;align-items:center;flex-direction:row"><input type="checkbox" id="aiChatCtx" style="width:18px;min-height:0" ${chat.ctx ? "checked" : ""}> Показывать ИИ мои данные (вес, питание, тренировки)</label>
       <label class="field" style="display:flex;gap:8px;align-items:center;flex-direction:row"><input type="checkbox" id="aiChatDiary" style="width:18px;min-height:0" ${chat.diary !== false ? "checked" : ""}> ИИ может предлагать записи в дневник (еда, вес, цели) — только с вашего подтверждения</label>
       <label class="field">Память — ИИ учитывает это во всех чатах<textarea id="aiMemory" placeholder="например: мне 30 лет, цель — набрать мышцы, не ем рыбу" style="min-height:70px">${esc(s.aiMemory || "")}</textarea></label>
+      <div class="hint" id="aiMemCnt" style="margin:-4px 0 8px"></div>
+      <label class="field">Сколько последних сообщений чата отправлять ИИ<select id="aiHistLimit">${[10, 20, 30, 60, 100, 200].map(n => `<option value="${n}"${(s.aiHistoryLimit || 30) === n ? " selected" : ""}>${n}</option>`).join("")}</select></label>
       <label class="field">Инструкция для этого чата (необязательно)<textarea id="aiChatInstr" placeholder="например: отвечай кратко" style="min-height:56px">${esc(chat.instr || "")}</textarea></label>
       <div class="btn-row"><button class="small ghost" data-action="aiChatRename">Переименовать</button><button class="small danger" data-action="aiChatDelete">Удалить чат</button></div>
     </details>
@@ -2764,7 +2874,10 @@ function openAiChat(id) {
   aiBindModelSelect($("#aiChatModel"), v => { chat.model = v; touch(chat); persist(); });
   $("#aiChatCtx").addEventListener("change", e => { chat.ctx = e.target.checked; touch(chat); persist(); });
   $("#aiChatDiary").addEventListener("change", e => { chat.diary = e.target.checked; touch(chat); persist(); });
+  const memCnt = () => { const n = ($("#aiMemory").value || "").length; $("#aiMemCnt").textContent = `Память: ${n} симв. (~${Math.round(n / 3)} токенов в каждом запросе)${n > 4000 ? " — многовато, это расходует лимиты ключа" : ""}`; };
+  $("#aiMemory").addEventListener("input", memCnt); memCnt();
   $("#aiMemory").addEventListener("change", e => { data.settings.aiMemory = e.target.value; persist(); toast("Память сохранена"); });
+  $("#aiHistLimit").addEventListener("change", e => { data.settings.aiHistoryLimit = +e.target.value; persist(); });
   $("#aiChatInstr").addEventListener("change", e => { chat.instr = e.target.value; touch(chat); persist(); });
   aiRenderMsgs(false);
 }
@@ -2937,8 +3050,8 @@ let _idb = null;
 function idb() {
   if (_idb) return _idb;
   _idb = new Promise((res, rej) => {
-    const rq = indexedDB.open("dnevnik-local", 1);
-    rq.onupgradeneeded = () => { const db = rq.result; db.createObjectStore("photos", { keyPath: "id" }); db.createObjectStore("backups", { keyPath: "id" }); };
+    const rq = indexedDB.open("dnevnik-local", 2);
+    rq.onupgradeneeded = () => { const db = rq.result; ["photos", "backups", "chats"].forEach(n => { if (!db.objectStoreNames.contains(n)) db.createObjectStore(n, { keyPath: "id" }); }); };
     rq.onsuccess = () => res(rq.result);
     rq.onerror = () => rej(rq.error);
   });
@@ -3020,10 +3133,11 @@ async function openPhotoCompare() {
 
 async function bkMake(label) {
   const payload = JSON.parse(JSON.stringify(data));
+  payload.chats = JSON.parse(JSON.stringify(CHATS));
   ["aiKey", "aiKeys", "aiKeyIdx", "openaiKey", "geminiKey", "firebaseConfig"].forEach(k => { delete payload.settings[k]; });
   (payload.chats || []).forEach(c => (c.messages || []).forEach(m => { delete m.img; }));
   const json = JSON.stringify(payload);
-  await idbPut("backups", { id: new Date().toISOString(), ts: Date.now(), label: label || "авто", size: json.length, json, counts: { foods: data.foods.length, weights: data.weights.length, workouts: data.workouts.length, chats: (data.chats || []).length } });
+  await idbPut("backups", { id: new Date().toISOString(), ts: Date.now(), label: label || "авто", size: json.length, json, counts: { foods: data.foods.length, weights: data.weights.length, workouts: data.workouts.length, chats: CHATS.length } });
   const all = (await idbAll("backups")).sort((a, b) => b.ts - a.ts);
   for (const old of all.slice(7)) await idbDel("backups", old.id);
 }
@@ -3064,8 +3178,14 @@ async function renderExtraSettings() {
     let list = [];
     try { list = (await idbAll("backups")).sort((a, b) => b.ts - a.ts); } catch { /* нет доступа */ }
     const last = s.lastExportAt ? Math.floor((Date.now() - s.lastExportAt) / 86400000) : null;
+    let usage = "";
+    try {
+      const est = navigator.storage && navigator.storage.estimate ? await navigator.storage.estimate() : null;
+      usage = `Занято: дневник ~${Math.round(JSON.stringify(data).length / 1024)} КБ, чаты ~${Math.round(JSON.stringify(CHATS).length / 1024)} КБ` + (est && est.quota ? ` · всего приложением ${(est.usage / 1048576).toFixed(1)} МБ из ~${Math.round(est.quota / 1048576)} МБ доступных` : "") + ".";
+    } catch { /* не критично */ }
     bk.innerHTML = `<div class="panel"><div class="section-title">Резервные копии 🛟</div>
       <div class="hint" style="margin:0 0 8px">${last === null ? "Копия-файл ещё не сохранялась." : `Последняя копия-файл: ${last === 0 ? "сегодня" : last + " дн. назад"}.`} Раз в день приложение само делает снимок данных на этом устройстве (последние 7).</div>
+      <div class="hint" style="margin:0 0 8px">${esc(usage)}</div>
       <div class="btn-row"><button data-action="exportData">Сохранить копию-файл (в облако или мессенджер)</button></div>
       <div class="btn-row"><button class="ghost" data-action="bkSnapshot">Сделать снимок на устройстве сейчас</button></div>
       ${list.length ? list.map(b => `<div class="ai-chat-item"><div class="main" style="cursor:default"><div class="t">${new Date(b.ts).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })} · ${esc(b.label)}</div><div class="s">еда ${b.counts.foods} · вес ${b.counts.weights} · тренировки ${b.counts.workouts} · чаты ${b.counts.chats} · ${Math.round(b.size / 1024)} КБ</div></div><button class="small ghost" data-action="bkRestore" data-id="${esc(b.id)}">Восстановить</button></div>`).join("") : ""}
@@ -4008,7 +4128,7 @@ function mergeCloud(cloud) {
   data.workouts = mergeArr(data.workouts, cloud.workouts || []);
   data.customFoods = mergeArr(data.customFoods, cloud.customFoods || []);
   data.plans = mergeArr(data.plans, cloud.plans || []);
-  data.chats = mergeArr(data.chats || [], cloud.chats || []);
+  if (Array.isArray(cloud.chats)) CHATS = mergeArr(CHATS, cloud.chats);
   data.mealPlan = data.mealPlan || {};
   for (const [d, items] of Object.entries(cloud.mealPlan || {})) {
     data.mealPlan[d] = mergeArr(data.mealPlan[d] || [], items);
@@ -4033,7 +4153,7 @@ async function syncPush(silent) {
     const { doc, setDoc } = fbModules.dbMod;
     const payload = JSON.parse(JSON.stringify(data));
     payload.settings = { ...payload.settings, geminiKey: "", openaiKey: "", aiKey: "", aiKeys: [], firebaseConfig: "" }; // секреты не покидают устройство
-    payload.chats = (payload.chats || []).map(c => ({ ...c, messages: (c.messages || []).map(m => { const r = { ...m }; delete r.img; return r; }) })); // картинки в облако не отправляем (лимит размера документа)
+    delete payload.chats; // чаты в облако не отправляем: у документа Firestore лимит 1 МБ
     await setDoc(doc(fbDb, "users", fbUser.uid), { data: JSON.stringify(payload), syncedAt: Date.now() });
     syncState = { ok: true, err: false, msg: "Синхронизировано " + new Date().toLocaleTimeString("ru-RU") };
     renderSyncSection();
@@ -4156,6 +4276,7 @@ const actions = {
       const snap = JSON.parse(rec.json), keep = {};
       ["aiKey", "aiKeys", "aiKeyIdx", "openaiKey", "geminiKey", "firebaseConfig"].forEach(k => { if (data.settings[k] !== undefined) keep[k] = data.settings[k]; });
       const d = Object.assign(defaultData(), snap);
+      if (Array.isArray(snap.chats)) { CHATS = snap.chats; delete d.chats; }
       d.settings = Object.assign({}, DEFAULT_SETTINGS, snap.settings || {}, keep);
       data = d; persist(); renderAll(); toast("Данные восстановлены из снимка");
     } catch (e) { toast("Не удалось восстановить: " + String((e && e.message) || e), true); }
@@ -4166,6 +4287,7 @@ const actions = {
     const ok = await restNotifSchedule(Date.now() + 5000, "Тестовое уведомление: таймер отдыха работает ✅");
     if (st) st.textContent = ok ? "Запланировано. Выключите экран или сверните приложение и подождите 5 секунд." : "Не удалось: разрешите уведомления для приложения в настройках Android.";
   },
+  aiChatsImport: () => { const i = $("#aiImpInput"); if (i) i.click(); },
   aiReportNow: async () => { toast("Готовлю отчёт…"); const c = await aiMakeWeeklyReport(true); if (c) openAiChat(c.id); },
   aiFetchModels: async () => {
     const el = $("#aiStatus"); if (el) el.textContent = "Загружаю список моделей…";
@@ -4182,11 +4304,11 @@ const actions = {
   aiChatOpen: (el) => openAiChat(el.dataset.id),
   aiChatDel: (el) => {
     const c = aiChatById(el.dataset.id);
-    if (c && confirm(`Удалить чат «${c.title || "Новый чат"}»?`)) { data.chats = aiChats().filter(x => x.id !== c.id); tombstone(c.id); persist(); openAiChatList(); }
+    if (c && confirm(`Удалить чат «${c.title || "Новый чат"}»?`)) { CHATS = CHATS.filter(x => x.id !== c.id); tombstone(c.id); persist(); openAiChatList(); }
   },
   aiChatDelete: () => {
     const c = aiChatById(aiCurChat);
-    if (c && confirm(`Удалить чат «${c.title || "Новый чат"}»?`)) { data.chats = aiChats().filter(x => x.id !== c.id); tombstone(c.id); persist(); openAiChatList(); }
+    if (c && confirm(`Удалить чат «${c.title || "Новый чат"}»?`)) { CHATS = CHATS.filter(x => x.id !== c.id); tombstone(c.id); persist(); openAiChatList(); }
   },
   aiChatRename: () => {
     const c = aiChatById(aiCurChat); if (!c) return;
@@ -4520,6 +4642,7 @@ const actions = {
   exportData: () => {
     const payload = JSON.parse(JSON.stringify(data));
     payload.settings = { ...payload.settings, geminiKey: "", openaiKey: "", aiKey: "", aiKeys: [], firebaseConfig: "" }; // ключи в экспорт не включаем
+    payload.chats = CHATS; // чаты (с картинками) уезжают в файл вместе с данными
     saveFile(`dnevnik-zdorovia-${todayStr()}.json`, JSON.stringify(payload, null, 2), "application/json");
     data.settings.lastExportAt = Date.now(); persist(); renderBackupBanner();
     toast("Файл с данными готов");
@@ -4570,7 +4693,7 @@ const actions = {
           }
           persist(); renderAll();
           const cnt = a => (Array.isArray(a) ? a.length : 0);
-          toast(`Импортировано: питание ${cnt(imported.foods)}, вес ${cnt(imported.weights)}, тренировки ${cnt(imported.workouts)}, планы ${cnt(imported.plans)}`);
+          toast(`Импортировано: питание ${cnt(imported.foods)}, вес ${cnt(imported.weights)}, тренировки ${cnt(imported.workouts)}, планы ${cnt(imported.plans)}, чаты ${cnt(imported.chats)}`);
         } catch { toast("Не удалось прочитать файл — это экспорт этого приложения?", true); }
       };
       r.readAsText(file);
